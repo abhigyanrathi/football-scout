@@ -110,6 +110,64 @@ def minutes_agreement(links, appearances):
     return matched
 
 
+def within_band(ratio):
+    return (ratio >= 0.8) & (ratio <= 1.2)
+
+
+def agreement_summary(agree, groups):
+    """Pairs, median ratio and share within 0.8 to 1.2 for pairs with 450 or more minutes."""
+    big = agree[agree.minutes >= 450]
+    rows = []
+    parts = [("ALL", big)] + [(k, big[big[groups] == k]) for k in sorted(big[groups].unique())]
+    for label, g in parts:
+        rows.append(
+            {
+                groups: label,
+                "pairs": len(g),
+                "median_ratio": round(g.ratio.median(), 3),
+                "share_within": round(within_band(g.ratio).mean(), 4),
+            }
+        )
+    return pd.DataFrame(rows)
+
+
+def player_table(links):
+    """One row per StatsBomb player over the matched and unmatched rows of all their teams."""
+    g = links.assign(is_matched=links.status == "matched").groupby("player_id")
+    ids = g.tm_player_id.agg(lambda s: sorted(s.dropna().unique()))
+    n_matched = g.is_matched.sum().astype(int)
+    return pd.DataFrame(
+        {
+            "tm_player_id": ids.map(lambda v: v[0] if len(v) == 1 else pd.NA).astype("Int64"),
+            "n_tm_ids": ids.map(len),
+            "minutes": g.minutes.sum(),
+            "n_matched": n_matched,
+            "n_unmatched": g.size() - n_matched,
+        }
+    ).reset_index()
+
+
+def shared_id_cases(links):
+    """Transfermarkt ids linked from more than one row, split by what the rows have in common."""
+    matched = links[links.status == "matched"]
+    out = {
+        "same_player_two_clubs": [],
+        "different_players_same_club": [],
+        "different_players_different_clubs": [],
+    }
+    for tm_id, g in matched.groupby("tm_player_id"):
+        if len(g) < 2:
+            continue
+        if g.player_id.nunique() == 1:
+            key = "same_player_two_clubs"
+        elif g[["league", "team_id"]].drop_duplicates().shape[0] == 1:
+            key = "different_players_same_club"
+        else:
+            key = "different_players_different_clubs"
+        out[key].append((tm_id, g))
+    return out
+
+
 def rate(df):
     return df[df.status == "matched"].minutes.sum() / df.minutes.sum()
 
@@ -167,6 +225,57 @@ def report(links, appearances):
     )
 
 
+def report_comparable(links, appearances):
+    agree = minutes_agreement(links, appearances)
+    print("\n== minutes agreement, pairs with 450 or more StatsBomb minutes")
+    print(agreement_summary(agree, "link_pass").to_string(index=False))
+    print(agreement_summary(agree, "league").to_string(index=False))
+    inside = within_band(agree.ratio)
+    big = agree.minutes >= 450
+    share_all = agree.minutes[inside].sum() / agree.minutes.sum()
+    share_big = agree.minutes[inside & big].sum() / agree.minutes[big].sum()
+    print(
+        "share of matched StatsBomb minutes in pairs within 0.8 to 1.2: "
+        f"all pairs {share_all:.4f}, pairs with 450+ minutes {share_big:.4f}"
+    )
+    far = agree[big].assign(gap=(agree.ratio - 1).abs()).sort_values("gap", ascending=False)
+    print("10 pairs with 450+ minutes farthest from 1: StatsBomb name | TM name | club | ratio")
+    for r in far.head(10).itertuples():
+        print(
+            f"{r.player_name} | {r.tm_name} | {r.tm_club} | "
+            f"StatsBomb {r.minutes} TM {r.tm_minutes} ratio {r.ratio:.3f}"
+        )
+
+
+def report_players(links, table):
+    print(f"\n== player-level table: {len(table)} StatsBomb players")
+    multi = table[table.n_tm_ids > 1]
+    print(f"(a) players whose rows link to more than one Transfermarkt id: {len(multi)}")
+    print(multi.to_string(index=False))
+    split = table[(table.n_matched > 0) & (table.n_unmatched > 0)]
+    print(f"(b) players with some rows matched and some unmatched: {len(split)}")
+    names = links.drop_duplicates("player_id").set_index("player_id").player_name
+    for r in split.itertuples():
+        rows = links[links.player_id == r.player_id]
+        print(f"{names[r.player_id]} (player_id {r.player_id}), minutes {r.minutes}")
+        print(
+            rows[["league", "team_name", "minutes", "status", "tm_player_id"]].to_string(
+                index=False
+            )
+        )
+    cases = shared_id_cases(links)
+    print("(c) Transfermarkt ids linked from more than one row:", sum(map(len, cases.values())))
+    for key, found in cases.items():
+        print(f"\n{key}: {len(found)}")
+        for tm_id, g in found:
+            print(f"Transfermarkt id {tm_id}")
+            print(
+                g[["player_id", "player_name", "league", "team_name", "minutes"]].to_string(
+                    index=False
+                )
+            )
+
+
 def main():
     sys.stdout.reconfigure(encoding="utf-8", errors="replace")
     appearances = data.tm_appearances()
@@ -183,6 +292,10 @@ def main():
         print(f"{r.player_name} | {r.nickname} | {r.tm_name} | {r.tm_club} | {r.minutes}")
     print("\n== after passes 1 and 2")
     report(final, appearances)
+    report_comparable(final, appearances)
+    table = player_table(final)
+    table.to_parquet(data.LINKS / "statsbomb_tm_players.parquet", index=False)
+    report_players(final, table)
 
 
 if __name__ == "__main__":
