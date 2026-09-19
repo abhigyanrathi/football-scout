@@ -50,4 +50,4 @@ Reason: The earlier entry reports 93.98% of all matched pairs within 0.8 to 1.2 
 ## 2026-09-19: Earliest whole transfer row per mover
 Decision: Each mover in the window is represented by the player's earliest qualifying transfer as a whole row.
 Alternatives considered: taking the first non-null value of each column, which the first version did.
-Reason: A null fee on the earliest transfer was replaced by the fee of a later one, mixing two transfers. This affected 0 movers, of whom 0 change label or funnel level.
+Reason: The old rule could mix two transfers: when the earliest transfer had a null fee, it took the fee of a later one. No mover in either cohort triggers this. All 10 players with more than one qualifying transfer (1 in the summer 2016 cohort, 9 in summer 2018) have a fee of 0.0 on the earliest, and the legacy and corrected rules give identical rows, labels and funnel levels.
