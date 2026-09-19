@@ -1,6 +1,6 @@
 import pandas as pd
 
-from fbrecruit.cohorts import add_cohort_rules, levels, mirror_labels
+from fbrecruit.cohorts import add_cohort_rules, levels, mirror_labels, window_movers
 
 NAN = float("nan")
 
@@ -85,6 +85,23 @@ def test_permanent_rule_and_sensitivity_set():
     out = add_cohort_rules(mv)
     assert out.permanent.tolist() == [True, True, False, True, False, False, False]
     assert out.sensitivity.tolist() == [False] * 5 + [True, False]
+
+
+def test_earliest_transfer_is_taken_as_a_whole_row():
+    tr = moves(
+        [
+            (1, "2016-07-01", 1, 2, NAN),
+            (1, "2016-08-01", 1, 3, 4e6),
+            (2, "2016-07-01", 1, 2, 1e6),
+            (2, "2016-08-01", 1, 3, 2e6),
+        ]
+    ).assign(from_club_name="A", to_club_name=lambda d: d.to_club_id.astype(str))
+    p = pd.DataFrame({"player_id": [1, 2], "main_club": [1, 1]}).set_index("player_id")
+    legacy = window_movers(tr, p, "2016-06-01", "2016-09-30", legacy=True).set_index("player_id")
+    whole = window_movers(tr, p, "2016-06-01", "2016-09-30").set_index("player_id")
+    assert (legacy.loc[1, "to_club_id"], legacy.loc[1, "transfer_fee"]) == (2, 4e6)
+    assert whole.loc[1, "to_club_id"] == 2 and pd.isna(whole.loc[1, "transfer_fee"])
+    assert whole.loc[2, "transfer_fee"] == 1e6
 
 
 def test_levels_follow_the_funnel():

@@ -63,16 +63,27 @@ def season_players(app, season, scope):
     return p[p.min_total >= MIN_MINUTES].copy()
 
 
-def window_movers(tr, p, start, end):
-    """The earliest transfer in the window out of the player's main club."""
+def qualifying_transfers(tr, p, start, end):
     inside = tr[(tr.date >= pd.Timestamp(start)) & (tr.date <= pd.Timestamp(end))]
     q = inside.merge(
         p.reset_index()[["player_id", "main_club"]],
         left_on=["player_id", "from_club_id"],
         right_on=["player_id", "main_club"],
     )
-    q = q[q.to_club_id != q.from_club_id].sort_values(["player_id", "date"])
-    mv = q.groupby("player_id").first().reset_index()
+    return q[q.to_club_id != q.from_club_id].sort_values(["player_id", "date"], kind="stable")
+
+
+def window_movers(tr, p, start, end, legacy=False):
+    """The earliest transfer in the window out of the player's main club, as a whole row.
+
+    legacy=True takes the first non-null value of each column instead, which can
+    combine the fee of a later transfer with the earliest one.
+    """
+    q = qualifying_transfers(tr, p, start, end)
+    if legacy:
+        mv = q.groupby("player_id").first().reset_index()
+    else:
+        mv = q.drop_duplicates("player_id")
     columns = ["player_id", "date", "from_club_id", "to_club_id", "from_club_name"]
     return mv[[*columns, "to_club_name", "transfer_fee"]]
 
@@ -182,7 +193,7 @@ def funnel_table(p, mv, stay, scope, linked):
     return pd.DataFrame(rows)
 
 
-def build(name, app, tr, links):
+def build(name, app, tr, links, legacy=False):
     cfg = COHORTS[name]
     season, nxt = cfg["season"], cfg["season"] + 1
     minutes = app.groupby(["season", "player_id"]).minutes_played.sum()
@@ -193,7 +204,7 @@ def build(name, app, tr, links):
 
     p = season_players(app, season, cfg["scope"])
     p["minutes_next"] = next_minutes.reindex(p.index).fillna(0)
-    mv = window_movers(tr, p, cfg["start"], cfg["end"])
+    mv = window_movers(tr, p, cfg["start"], cfg["end"], legacy)
     mv["league_comp"] = mv.player_id.map(p.league_comp)
     mv["min_total_season"] = mv.player_id.map(p.min_total)
     mv["minutes_next_season"] = mv.player_id.map(p.minutes_next)

@@ -45,6 +45,21 @@ FUNNEL_B = [
     ("Bundesliga", 348, 47, 45, 41, 34, 233, 226, 209),
     ("ALL", 1943, 321, 296, 258, 208, 1162, 1086, 1009),
 ]
+FUNNEL_BOTH_A = [
+    ("La Liga", 417, 56, 55, 45, 30, 224, 223, 210),
+    ("Ligue 1", 419, 47, 47, 35, 24, 219, 219, 195),
+    ("Premier League", 386, 29, 28, 23, 20, 257, 255, 235),
+    ("Serie A", 415, 54, 54, 46, 40, 227, 225, 208),
+    ("ALL", 1637, 186, 184, 149, 114, 927, 922, 848),
+]
+FUNNEL_BOTH_B = [
+    ("La Liga", 416, 83, 77, 67, 57, 227, 216, 204),
+    ("Ligue 1", 396, 70, 69, 60, 47, 217, 209, 195),
+    ("Premier League", 383, 36, 34, 32, 21, 275, 268, 246),
+    ("Serie A", 400, 85, 82, 68, 57, 210, 205, 188),
+    ("Bundesliga", 348, 47, 46, 42, 35, 233, 229, 212),
+    ("ALL", 1943, 321, 308, 269, 217, 1162, 1127, 1045),
+]
 LABELS_A = {
     "paid": 63,
     "paid_mirror": 9,
@@ -202,15 +217,28 @@ def links_for(df, status):
 
 
 @pytest.fixture(scope="module")
-def cohort_a(appearances, sb_final):
-    tr = data.tm_table("transfers").rename(columns={"transfer_date": "date"})
-    return cohorts.build("A", appearances, tr, links_for(sb_final, "matched"))
+def transfers():
+    return data.tm_table("transfers").rename(columns={"transfer_date": "date"})
 
 
 @pytest.fixture(scope="module")
-def cohort_b(appearances, wy_final):
-    tr = data.tm_table("transfers").rename(columns={"transfer_date": "date"})
-    return cohorts.build("B", appearances, tr, links_for(wy_final, "linked"))
+def cohort_a(appearances, transfers, sb_final):
+    return cohorts.build("A", appearances, transfers, links_for(sb_final, "matched"), legacy=True)
+
+
+@pytest.fixture(scope="module")
+def cohort_b(appearances, transfers, wy_final):
+    return cohorts.build("B", appearances, transfers, links_for(wy_final, "linked"), legacy=True)
+
+
+@pytest.fixture(scope="module")
+def corrected_a(appearances, transfers, sb_final):
+    return cohorts.build("A", appearances, transfers, links_for(sb_final, "matched"))
+
+
+@pytest.fixture(scope="module")
+def corrected_b(appearances, transfers, wy_final):
+    return cohorts.build("B", appearances, transfers, links_for(wy_final, "linked"))
 
 
 def rows(table):
@@ -237,3 +265,21 @@ def test_cohort_anchors(request, name, funnel, labels, levels, june30, july1, re
     assert int(mv.returned.sum()) == returned
     day = mv.date.dt.strftime("%m-%d")
     assert (int((day == "06-30").sum()), int((day == "07-01").sum())) == (june30, july1)
+
+
+@pytest.mark.parametrize(
+    ("name", "funnel", "funnel_both", "labels", "levels", "permanent", "sensitivity"),
+    [
+        ("A", FUNNEL_A, FUNNEL_BOTH_A, LABELS_A, LEVELS_A, 88, 32),
+        ("B", FUNNEL_B, FUNNEL_BOTH_B, LABELS_B, LEVELS_B, 136, 66),
+    ],
+)
+def test_corrected_mover_selection(
+    request, name, funnel, funnel_both, labels, levels, permanent, sensitivity
+):
+    mv, tables = request.getfixturevalue(f"corrected_{name.lower()}")
+    assert rows(tables["pass 1"]) == funnel
+    assert rows(tables["passes 1 and 2"]) == funnel_both
+    assert mv.mirror_label.value_counts().to_dict() == labels
+    assert per_label(mv) == levels
+    assert (int(mv.permanent.sum()), int(mv.sensitivity.sum())) == (permanent, sensitivity)
