@@ -66,3 +66,23 @@ Reason: A window-2 target must come from a model that never trained on window-2 
 Decision: A player-team enters a window-1 to window-2 pair with at least 450 minutes in window 1 and 270 in window 2. That gives 1,144 pairs in the pooled table: La Liga 299, Premier League 278, Serie A 280, Ligue 1 287.
 Alternatives considered: window-1 minimums of 180, 270, 360 and 450 crossed with window-2 minimums of 180, 270 and 360. Pair counts run from 1,335 (180 and 180) to 1,073 (450 and 360).
 Reason: 450 minutes is the project's existing minimum for a player season. In window 2, 270 minutes is three full matches and 20% of the 1,350-minute maximum; raising the window-2 minimum from 180 to 270 costs 46 pairs. The threshold was chosen on minutes and cohort size, not on the correlations below. As a pipeline diagnostic only (no shrinkage, no controls, no held-out structure), the correlation between window-1 and window-2 pooled VAEP/90 ranges from 0.3244 to 0.3851 (Pearson) and 0.2671 to 0.3047 (Spearman) across the grid, and is 0.3807 and 0.3018 at the chosen threshold. It is not a result.
+
+## 2026-09-20: Recalibration method
+Decision: Scores and concedes probabilities are recalibrated with a logistic map on the logit, p_cal = 1 / (1 + exp(-(a + b * logit(p)))), fit by unpenalized maximum likelihood, one map per rating model, league and label.
+Alternatives considered: isotonic regression.
+Reason: Out of sample the raw classifiers are over-dispersed (for the pooled scores model on window 2, the lowest decile is under-predicted by a factor of 2.65 and the top decile over-predicted), and action values are differences of these probabilities. Isotonic regression was rejected because it is piecewise constant: consecutive states in the same block would get identical probabilities and a value change of exactly zero, and one league's window 1 holds only 932 to 1,085 concedes positives to fit on.
+
+## 2026-09-20: Calibration data
+Decision: Every calibrator is fit on window-1 rows only, using predictions from a classifier that never trained on those rows: for the pooled model, out-of-fold predictions from five game-level folds, the pooled model itself unchanged; for each leave-one-league-out model, its own predictions for its held-out league. Window-2 outcomes enter no fitted component and are used only to report calibration.
+Alternatives considered: fitting calibrators on window 2; fitting the pooled calibrators on the pooled model's own window-1 predictions.
+Reason: Fitting on window 2 would use the target, and the pooled model's own window-1 predictions are in-sample. Folds are whole games because labels and features span neighbouring actions within a game and each value is a difference of consecutive states.
+
+## 2026-09-20: Leakage rule for leave-one-league-out, amended
+Decision: The classifier never trains on the held-out league; its calibrator may be fit on that league's window-1 outcomes; neither uses window 2. The leave-one-league-out result therefore measures transfer to a new league after recalibration on that league's first 23 matchdays, and is described that way. The earlier leakage-rule entry still governs the classifier.
+Alternatives considered: a calibrator fit on the three training leagues.
+Reason: Miscalibration is league-specific (concedes under-predicted by 13% to 15% for held-out La Liga and Ligue 1), so a calibrator fit on the training leagues would not correct the held-out one.
+
+## 2026-09-20: Pooled window-1 values
+Decision: Pooled window-1 action values come from calibrated out-of-fold predictions and window-2 values from the calibrated pooled model; the uncalibrated tables are kept and the calibrated tables are written beside them.
+Alternatives considered: calibrating the pooled model's own window-1 predictions; replacing the uncalibrated tables.
+Reason: The pooled model trained on every window-1 row, so its window-1 predictions are in-sample (window-1 log loss in-sample against out-of-fold: scores 0.039959 against 0.046413, concedes 0.009418 against 0.013928), and a calibrator learned on out-of-sample predictions does not describe them.
