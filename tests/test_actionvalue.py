@@ -1,8 +1,11 @@
 import pandas as pd
 import pytest
 
+from fbrecruit import actionvalue
 from fbrecruit.actionvalue import (
+    COLUMNS,
     FITS,
+    Rows,
     labels_path,
     per90,
     rating_fit,
@@ -94,6 +97,32 @@ def test_per90_arithmetic_and_zero_minutes():
 def test_lolo_values_come_from_the_model_that_excluded_the_league():
     assert rating_fit("lolo", "serie_a") == "lolo_serie_a"
     assert rating_fit("pooled", "serie_a") == "pooled"
+
+
+def feed(monkeypatch, labels):
+    keys = pd.DataFrame({"game_id": [1, 1, 2], "action_id": [0, 1, 0]})
+    x = pd.concat([keys, pd.DataFrame(0.0, index=keys.index, columns=COLUMNS)], axis=1)
+    monkeypatch.setattr(actionvalue, "batches", lambda league, games: iter([(x, None)]))
+    rows = Rows([("liga", 1)], labels)
+    rows.reset()
+    fed = {}
+    return rows.next(lambda **kw: fed.update(kw)), fed
+
+
+def test_rows_accepts_aligned_keys(monkeypatch):
+    labels = pd.DataFrame(
+        {"game_id": [1, 1, 2], "action_id": [0, 1, 0], "scores": [True, False, False]}
+    )
+    assert feed(monkeypatch, labels)[1]["label"].tolist() == [True, False, False]
+
+
+def test_rows_rejects_misaligned_keys(monkeypatch):
+    # The same positives in a different row order: a positive-count check would pass.
+    labels = pd.DataFrame(
+        {"game_id": [1, 1, 2], "action_id": [1, 0, 0], "scores": [True, False, False]}
+    )
+    with pytest.raises(AssertionError):
+        feed(monkeypatch, labels)
 
 
 def test_lolo_fits_exclude_their_league():

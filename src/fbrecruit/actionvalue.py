@@ -114,10 +114,20 @@ def game_ids(league, window):
     return set(w[(w.league == league) & (w.window == window)].game_id)
 
 
-def batches(league, window=None):
-    """Features and labels of one league, optionally one window, in file order."""
+def selected(league, games):
+    """The game ids of a window number, or a set of game ids as given."""
+    return games if isinstance(games, set) else game_ids(league, games)
+
+
+def check_keys(x, y):
+    """Feature and label rows must be the same actions in the same order."""
+    assert len(x) == len(y) and (x[KEYS].to_numpy() == y[KEYS].to_numpy()).all()
+
+
+def batches(league, games=None):
+    """Features and labels of one league, optionally one window or set of games, in file order."""
     labels = pd.read_parquet(labels_path(league))
-    keep_ids = None if window is None else game_ids(league, window)
+    keep_ids = None if games is None else selected(league, games)
     offset = 0
     for batch in pq.ParquetFile(features_path(league)).iter_batches(BATCH):
         x = batch.to_pandas()
@@ -133,45 +143,55 @@ def batches(league, window=None):
 
 
 class Rows(xgb.DataIter):
-    def __init__(self, parts):
+    """Feature batches, each checked against the same rows of the training labels."""
+
+    def __init__(self, parts, labels):
         self.parts = parts
+        self.labels = labels
         self.rows = None
+        self.offset = 0
         super().__init__()
 
     def reset(self):
-        self.rows = (b for league, window in self.parts for b in batches(league, window))
+        self.rows = (b for league, games in self.parts for b in batches(league, games))
+        self.offset = 0
 
     def next(self, input_data):
         b = next(self.rows, None)
         if b is None:
             return 0
-        x, y = b
+        x = b[0]
+        y = self.labels.iloc[self.offset : self.offset + len(x)]
+        self.offset += len(x)
+        check_keys(x, y)
         input_data(data=x[COLUMNS], label=y.scores.to_numpy())
         return 1
 
 
 def train_labels(parts):
     frames = [
-        pd.read_parquet(labels_path(lg)).loc[lambda d, lg=lg, w=w: d.game_id.isin(game_ids(lg, w))]
+        pd.read_parquet(labels_path(lg)).loc[lambda d, lg=lg, w=w: d.game_id.isin(selected(lg, w))]
         for lg, w in parts
     ]
     return pd.concat(frames, ignore_index=True)
 
 
-def fit(name, labels=LABELS, save=True):
-    parts = [(lg, 1) for lg in FITS[name]]
+def fit(name, labels=LABELS, save=True, parts=None):
+    """Parts are (league, window number or set of game ids); the default is the fit's window 1."""
+    parts = parts or [(lg, 1) for lg in FITS[name]]
     y = train_labels(parts)
     start = time.perf_counter()
-    rows = Rows(parts)
+    rows = Rows(parts, y)
     rows.reset()
     dm = xgb.QuantileDMatrix(rows, nthread=PARAMS["n_jobs"])
+    assert dm.num_row() == len(y)
     built = time.perf_counter() - start
-    print(f"== fit {name}: leagues {FITS[name]}, window 1, rows {dm.num_row()} (labels {len(y)})")
+    leagues = [lg for lg, _ in parts]
+    print(f"== fit {name}: leagues {leagues}, window 1, rows {dm.num_row()} (labels {len(y)})")
     print(f"QuantileDMatrix built in {built:.1f} s")
     boosters = {}
     for label in labels:
         dm.set_label(y[label].to_numpy())
-        assert int(dm.get_label().sum()) == int(y[label].sum())
         t = time.perf_counter()
         boosters[label] = xgb.train(PARAMS, dm, ROUNDS, verbose_eval=False)
         secs = time.perf_counter() - t
