@@ -41,3 +41,13 @@ Reason: Exact date of birth is a strong key. The first pass links 93.41% of the 
 Decision: The Transfermarkt transfers table has no loan flag, so each mover in the summer window is labelled by whether the same player has a mirror move (clubs swapped) within three years: paid, paid_mirror, loan_return, loan_out, both or free_other. The primary transfer cohort is permanent moves: paid, paid_mirror, and free_other not dated 30 June. Loan endings and moves labelled both are excluded; loan-outs are kept as a sensitivity set.
 Alternatives considered: treating every mover in the window as a transfer; flagging loans by whether the player reappears for the old club two seasons later.
 Reason: In the summer 2016 cohort 64 of 186 movers, and in summer 2018 118 of 321, are dated 30 June with a fee of zero or null, and the mirror label identifies 62 of the 64 and all 118 as loan endings. The reappearance heuristic flags only 7 of 32 and 9 of 66 loan-outs. At the last funnel stage (linked, 450 or more minutes the next season, destination in the same leagues) the permanent cohorts number 54 and 108.
+
+## 2026-09-19: Correction to the StatsBomb minutes-agreement figure
+Decision: Judge the StatsBomb links by minutes agreement among matched pairs with 450 or more StatsBomb minutes, as for Wyscout.
+Alternatives considered: all matched pairs.
+Reason: The earlier entry reports 93.98% of all matched pairs within 0.8 to 1.2 times. The farthest pairs there are players with fewer than 60 minutes, where a few minutes of difference is a large ratio. Among pairs with 450 or more StatsBomb minutes the share is 99.94% (median ratio 0.954); the Wyscout figure on the same basis is 99.9%.
+
+## 2026-09-19: Earliest whole transfer row per mover
+Decision: Each mover in the window is represented by the player's earliest qualifying transfer as a whole row.
+Alternatives considered: taking the first non-null value of each column, which the first version did.
+Reason: A null fee on the earliest transfer was replaced by the fee of a later one, mixing two transfers. This affected 0 movers, of whom 0 change label or funnel level.
