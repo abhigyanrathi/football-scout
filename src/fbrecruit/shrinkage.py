@@ -5,6 +5,7 @@ from pathlib import Path
 
 import numpy as np
 import pandas as pd
+from scipy.stats import rankdata
 
 from fbrecruit import actionvalue as av
 from fbrecruit import calibration as cal
@@ -15,12 +16,18 @@ from fbrecruit.split import windows
 
 LOGS = Path("C:/Users/abhig/fb-scratch")
 BRANCHES = cal.BRANCHES
+# The order the league indicator columns and the per-league arrays are built in.
+LEAGUE_ORDER = list(LEAGUES)
 GROUPS = ["GK", "CB", "FB", "MID", "WIDE", "FWD", "UNKNOWN"]
+OUTFIELD = ["CB", "FB", "MID", "WIDE", "FWD"]
 W1_MINUTES = 450
 W2_MINUTES = 270
 KEYS = ["league", "player_id", "team_id"]
 COMPONENTS = {"total": "vaep_value", "offensive": "offensive_value", "defensive": "defensive_value"}
+PREDICTORS = ["P0", "P1", "P2", "P3", "P4"]
 VARIANTS = {"slope": True, "no_slope": False}
+REPLICATES = 2000
+SEED = 0
 PER90 = 8100.0
 
 WIDE_NAMES = {"Left Midfield", "Right Midfield"}
@@ -70,8 +77,16 @@ def game_path(branch):
     return PROCESSED / f"player_game_vaep_{branch}.parquet"
 
 
+def evaluation_path(branch):
+    return PROCESSED / f"evaluation_{branch}.parquet"
+
+
 def shrinkage_path(branch):
     return PROCESSED / f"shrinkage_{branch}.parquet"
+
+
+def bootstrap_path(branch):
+    return PROCESSED / f"bootstrap_{branch}.parquet"
 
 
 class Tee:
@@ -578,6 +593,282 @@ def fit():
         )
 
 
+# ------------------------------------------------- steps 5 and 6: predictors and metrics
+
+
+def league_levels(branch):
+    """c(league, window): 90 * summed value over summed minutes across every row of the table."""
+    t = v2_table(branch)
+    a = t.groupby(["league", "window"]).agg(v=("vaep_sum", "sum"), m=("minutes", "sum"))
+    return 90 * a.v / a.m
+
+
+def build_evaluation(branch):
+    t = v2_table(branch)
+    pr = av.pairs(t, W1_MINUTES, W2_MINUTES)
+    w2 = t[t.window == 2][[*KEYS, "minutes"]].rename(columns={"minutes": "minutes_w2"})
+    pr = pr.merge(w2, on=KEYS, how="left", validate="one_to_one")
+    sh = pd.read_parquet(shrinkage_path(branch))
+    cols = [*KEYS, "group", "minutes", "psi", "xb", "theta", "theta_no_slope"]
+    pr = pr.merge(sh[cols].rename(columns={"minutes": "minutes_w1"}), on=KEYS, how="left")
+    assert pr.group.notna().all(), "a pair's player is outside the estimation population"
+
+    c = league_levels(branch)
+    pr["c1"] = pr.league.map(c.xs(1, level="window"))
+    pr["c2"] = pr.league.map(c.xs(2, level="window"))
+    pr["target"] = pr.vaep_per90_w2 - pr.c2
+    pr["P0"] = 0.0
+    pr["P1"] = pr.xb - pr.c1
+    pr["P2"] = pr.vaep_per90_w1 - pr.c1
+    pr["P3"] = pr.theta - pr.c1
+    pr["P4"] = pr.theta_no_slope - pr.c1
+
+    pg = pd.read_parquet(game_path(branch))
+    phi = phi_table(player_stats(pg, population(branch)))
+    pr["phi"] = pr.group.map(phi.phi_total)
+    pr["psi2"] = PER90 * pr.phi / pr.minutes_w2
+    pr.to_parquet(evaluation_path(branch), index=False)
+    return pr, c
+
+
+def ols_line(x, y):
+    if np.std(x) == 0:
+        return float("nan"), float("nan")
+    coef = np.linalg.lstsq(np.column_stack([np.ones(len(x)), x]), y, rcond=None)[0]
+    return float(coef[1]), float(coef[0])
+
+
+def spearman(x, y):
+    if np.std(x) == 0:
+        return float("nan")
+    return float(np.corrcoef(rankdata(x), rankdata(y))[0, 1])
+
+
+def subset_metrics(target, preds, psi2):
+    """TSE with the target's own sampling variance subtracted, and the shape of the fit."""
+    raw = {k: float(((target - v) ** 2).sum()) for k, v in preds.items()}
+    correction = float(psi2.sum())
+    tse = {k: raw[k] - correction for k in raw}
+    rows = []
+    for k in PREDICTORS:
+        slope, intercept = ols_line(preds[k], target)
+        rows.append(
+            {"predictor": k, "tse": tse[k], "tse_ratio": tse[k] / tse["P2"]}
+            | {"raw_ratio": raw[k] / raw["P2"], "spearman": spearman(preds[k], target)}
+            | {"slope": slope, "intercept": intercept}
+        )
+    return rows, tse["P3"] - tse["P2"]
+
+
+def subsets(frame):
+    """The headline is every outfield pair; each league is outfield too, GK stands alone."""
+    out = {"outfield": frame.group.isin(OUTFIELD)}
+    out |= {lg: out["outfield"] & (frame.league == lg) for lg in LEAGUES}
+    return out | {"GK": frame.group == "GK"}
+
+
+def metric_table(frame):
+    rows, diffs = [], {}
+    for name, mask in subsets(frame).items():
+        part = frame[mask]
+        preds = {k: part[k].to_numpy() for k in PREDICTORS}
+        got, diffs[name] = subset_metrics(part.target.to_numpy(), preds, part.psi2.to_numpy())
+        rows += [{"subset": name, "pairs": len(part)} | r for r in got]
+    return pd.DataFrame(rows), diffs
+
+
+def evaluate():
+    for branch in BRANCHES:
+        key(f"\n================ {branch}")
+        pr, c = build_evaluation(branch)
+        key(f"5a {branch}: league-window levels c")
+        for (lg, w), v in c.items():
+            key(f"c({lg}, {w}) = {v!r}")
+        counts = pr.assign(kind=np.where(pr.group.isin(OUTFIELD), "outfield", pr.group))
+        key(f"\n5b {branch}: pairs {len(pr)}")
+        key(counts.groupby(["league", "kind"]).size().unstack(fill_value=0).to_string())
+        key(counts.kind.value_counts().to_string())
+
+        table, diffs = metric_table(pr)
+        key(f"\n6b {branch}: metrics per subset and predictor")
+        key(show(table, 6))
+        for r in table.itertuples():
+            key(
+                f"6d {branch} {r.subset} {r.predictor}: tse {r.tse!r}, ratio {r.tse_ratio!r}, "
+                f"uncorrected ratio {r.raw_ratio!r}, spearman {r.spearman!r}, "
+                f"slope {r.slope!r}, intercept {r.intercept!r}"
+            )
+        for name, d in diffs.items():
+            key(f"6d {branch} {name}: TSE(P3) - TSE(P2) {d!r}")
+
+
+# ---------------------------------------------------------------- step 7: bootstrap
+
+
+def cluster_index(t):
+    """One cluster per league and window-1 team; window-2 rows join the same team's cluster."""
+    cl = t[t.window == 1][["league", "team_id"]].drop_duplicates()
+    cl = cl.sort_values(["league", "team_id"]).reset_index(drop=True)
+    index = pd.Series(np.arange(len(cl)), index=pd.MultiIndex.from_frame(cl))
+    w2 = t[t.window == 2][["league", "team_id"]].drop_duplicates()
+    assert pd.MultiIndex.from_frame(w2).isin(index.index).all()
+    return cl, index
+
+
+def team_totals(t, index):
+    """Summed value and minutes per cluster and window, the inputs to a replicate's c."""
+    v = np.zeros((2, len(index)))
+    m = np.zeros((2, len(index)))
+    agg = t.groupby(["league", "window", "team_id"]).agg(
+        v=("vaep_sum", "sum"), m=("minutes", "sum")
+    )
+    for (lg, w, tid), row in agg.iterrows():
+        v[w - 1, index[(lg, tid)]] = row.v
+        m[w - 1, index[(lg, tid)]] = row.m
+    return v, m
+
+
+def bootstrap_inputs(branch):
+    """Arrays a replicate needs, so that no replicate regroups the per-game rows."""
+    pg = pd.read_parquet(game_path(branch))
+    pop = population(branch)
+    stats = player_stats(pg, pop)
+    ev = pd.read_parquet(evaluation_path(branch))
+    t = v2_table(branch)
+    cl, index = cluster_index(t)
+
+    groups = [g for g in GROUPS if g != "UNKNOWN"]
+    code = {g: i for i, g in enumerate(groups)}
+    keep = pop.group.isin(groups).to_numpy()
+    pop, stats = pop[keep].reset_index(drop=True), stats[keep].reset_index(drop=True)
+    ev = ev[ev.group.isin(groups)].reset_index(drop=True)
+    where = pd.Series(np.arange(len(pop)), index=pd.MultiIndex.from_frame(pop[KEYS]))
+    league = pop.league.to_numpy()
+    mins = pop.minutes.to_numpy(dtype=float)
+    return {
+        "groups": groups,
+        "league_clusters": [np.flatnonzero((cl.league == lg).to_numpy()) for lg in LEAGUES],
+        "team_v_m": team_totals(t, index),
+        "pop_cluster": index.loc[pd.MultiIndex.from_frame(pop[["league", "team_id"]])].to_numpy(),
+        "pop_code": pop.group.map(code).to_numpy(),
+        "pop_y": pop.vaep_per90.to_numpy(dtype=float),
+        "pop_minutes": mins,
+        "pop_s": stats.S_total.to_numpy(dtype=float),
+        "pop_df": (stats.n - 1).to_numpy(dtype=float),
+        "x": {name: design(league, mins, s) for name, s in VARIANTS.items()},
+        "ev_cluster": index.loc[pd.MultiIndex.from_frame(ev[["league", "team_id"]])].to_numpy(),
+        "ev_code": ev.group.map(code).to_numpy(),
+        "ev_league": np.array([LEAGUE_ORDER.index(lg) for lg in ev.league]),
+        "ev_pop": where.loc[pd.MultiIndex.from_frame(ev[KEYS])].to_numpy(),
+        "ev_y2": ev.vaep_per90_w2.to_numpy(dtype=float),
+        "ev_m2": ev.minutes_w2.to_numpy(dtype=float),
+        "masks": subsets(ev),
+        "pairs": len(ev),
+    }
+
+
+def replicate(d, mult):
+    """One replicate's c, phi, both fits and the drawn pair rows' target and predictors."""
+    levels = np.empty((2, len(LEAGUES)))
+    v, m = d["team_v_m"]
+    for i, cls in enumerate(d["league_clusters"]):
+        w = mult[cls]
+        levels[:, i] = 90 * (v[:, cls] @ w) / (m[:, cls] @ w)
+
+    code, n_groups = d["pop_code"], len(d["groups"])
+    sel = np.repeat(np.arange(len(code)), mult[d["pop_cluster"]])
+    s = np.bincount(code[sel], weights=d["pop_s"][sel], minlength=n_groups)
+    df = np.bincount(code[sel], weights=d["pop_df"][sel], minlength=n_groups)
+    phi = np.divide(s, df, out=np.zeros_like(s), where=df > 0)
+    psi = PER90 * phi[code] / d["pop_minutes"]
+
+    y = d["pop_y"]
+    out = {name: np.full(len(code), np.nan) for name in ("xb", "slope", "no_slope")}
+    for gi in range(n_groups):
+        drawn = sel[code[sel] == gi]
+        rows = code == gi
+        if not len(drawn):
+            continue
+        for name, x in d["x"].items():
+            f = fay_herriot(y[drawn], x[drawn], psi[drawn])
+            xb = x[rows] @ f["b"]
+            shrink = f["tau2"] / (f["tau2"] + psi[rows])
+            out[name][rows] = xb + shrink * (y[rows] - xb)
+            if name == "slope":
+                out["xb"][rows] = xb
+
+    pick = np.repeat(np.arange(d["pairs"]), mult[d["ev_cluster"]])
+    lg, row = d["ev_league"][pick], d["ev_pop"][pick]
+    c1, c2 = levels[0][lg], levels[1][lg]
+    preds = {
+        "P0": np.zeros(len(pick)),
+        "P1": out["xb"][row] - c1,
+        "P2": y[row] - c1,
+        "P3": out["slope"][row] - c1,
+        "P4": out["no_slope"][row] - c1,
+    }
+    target = d["ev_y2"][pick] - c2
+    psi2 = PER90 * phi[d["ev_code"][pick]] / d["ev_m2"][pick]
+    return pick, target, preds, psi2
+
+
+def bootstrap_branch(branch):
+    d = bootstrap_inputs(branch)
+    n_clusters = sum(len(c) for c in d["league_clusters"])
+    rng = np.random.default_rng(SEED)
+    rows = []
+    for rep in range(REPLICATES):
+        drawn = np.concatenate([rng.choice(c, size=len(c)) for c in d["league_clusters"]])
+        pick, target, preds, psi2 = replicate(d, np.bincount(drawn, minlength=n_clusters))
+        for name, mask in d["masks"].items():
+            m = mask.to_numpy()[pick]
+            got, diff = subset_metrics(target[m], {k: v[m] for k, v in preds.items()}, psi2[m])
+            for r in got:
+                for metric in ("tse", "tse_ratio", "raw_ratio", "spearman", "slope"):
+                    rows.append((rep, name, r["predictor"], metric, r[metric]))
+            rows.append((rep, name, "P3-P2", "tse_diff", diff))
+    out = pd.DataFrame(rows, columns=["replicate", "subset", "predictor", "metric", "value"])
+    out.to_parquet(bootstrap_path(branch), index=False)
+    return out
+
+
+def intervals(out):
+    q = out.groupby(["subset", "predictor", "metric"]).value.quantile([0.025, 0.975]).unstack()
+    q.columns = ["p2_5", "p97_5"]
+    return q.join(out.groupby(["subset", "predictor", "metric"]).value.median().rename("median"))
+
+
+def bootstrap():
+    key(
+        f"7c: the action-value classifiers and the calibrators are held fixed across all "
+        f"{REPLICATES} replicates; every interval below is conditional on them."
+    )
+    for branch in BRANCHES:
+        key(f"\n================ {branch}")
+        out = bootstrap_branch(branch)
+        q = intervals(out)
+        wanted = q.index.get_level_values("metric").isin(
+            ["tse_ratio", "tse_diff", "spearman", "slope"]
+        )
+        key(f"\n7d {branch}: 2.5 and 97.5 percentiles, {REPLICATES} replicates")
+        key(
+            "the outfield rows are the headline; each league's rows rest on that league's "
+            "20 teams alone"
+        )
+        key(show(q[wanted], 6))
+        head = q.loc[("outfield", "P3", "tse_ratio")]
+        key(
+            f"\n6c {branch} outfield TSE(P3) / TSE(P2): point estimate and interval "
+            f"[{head.p2_5!r}, {head.p97_5!r}]"
+        )
+        if branch == "pooled":
+            key(
+                f"6c CLAIM on the pooled branch, outfield: upper end {head.p97_5!r} below 1: "
+                f"{'PASS' if head.p97_5 < 1 else 'FAIL'}"
+            )
+        print(show(q, 8))
+
+
 def main(argv):
     step = argv[0]
     LOGS.mkdir(parents=True, exist_ok=True)
@@ -593,6 +884,10 @@ def main(argv):
             dispersion()
         elif step == "fit":
             fit()
+        elif step == "evaluate":
+            evaluate()
+        elif step == "bootstrap":
+            bootstrap()
     finally:
         sys.stdout = sys.__stdout__
         full.close()

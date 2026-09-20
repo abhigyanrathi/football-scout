@@ -213,12 +213,40 @@ FITS = {
         [0.1816277826529557, 0.1892603246091779, 0.18248400314968957, 0.17498510159888034],
     ),
 }
+LEVELS = {
+    # branch: (league, window): c
+    "pooled": {
+        ("la_liga", 1): 0.13528586106190904, ("la_liga", 2): 0.1419129250096161,
+        ("ligue_1", 1): 0.1262895229443143, ("ligue_1", 2): 0.1372066346741086,
+        ("premier_league", 1): 0.13938956255131857, ("premier_league", 2): 0.14444117326568673,
+        ("serie_a", 1): 0.13311059562044317, ("serie_a", 2): 0.12901582537621506,
+    },
+    "lolo": {
+        ("la_liga", 1): 0.13850006169638102, ("la_liga", 2): 0.14537928033580647,
+        ("ligue_1", 1): 0.12633215442003856, ("ligue_1", 2): 0.13668922447738638,
+        ("premier_league", 1): 0.13848538123251725, ("premier_league", 2): 0.14485264084036006,
+        ("serie_a", 1): 0.13317892049017022, ("serie_a", 2): 0.12763755834998927,
+    },
+}  # fmt: skip
+PAIRS = {
+    # (league, kind): pairs at 450 / 270, kind being outfield, GK or UNKNOWN
+    ("la_liga", "outfield"): 278, ("la_liga", "GK"): 20, ("la_liga", "UNKNOWN"): 1,
+    ("premier_league", "outfield"): 260, ("premier_league", "GK"): 18,
+    ("serie_a", "outfield"): 259, ("serie_a", "GK"): 21,
+    ("ligue_1", "outfield"): 270, ("ligue_1", "GK"): 17,
+}  # fmt: skip
+PAIR_TOTALS = {"outfield": 1067, "GK": 76, "UNKNOWN": 1}
 
 
 def need(path):
     if not path.exists():
         pytest.skip(f"local data cache missing: {path}")
     return path
+
+
+def evaluation(branch):
+    ev = pd.read_parquet(need(sh.evaluation_path(branch)))
+    return ev.assign(kind=ev.group.where(~ev.group.isin(sh.OUTFIELD), "outfield"))
 
 
 @pytest.mark.slow
@@ -261,3 +289,19 @@ def test_fay_herriot_variance_and_coefficients(branch):
         if f is not None
     }
     assert got == {k: (t, b) for k, (t, b) in FITS.items() if k[0] == branch}
+
+
+@pytest.mark.slow
+@pytest.mark.parametrize("branch", BRANCHES)
+def test_league_window_levels(branch):
+    need(sh.PROCESSED / f"player_window_vaep_{branch}_v2.parquet")
+    assert sh.league_levels(branch).to_dict() == LEVELS[branch]
+
+
+@pytest.mark.slow
+@pytest.mark.parametrize("branch", BRANCHES)
+def test_evaluation_pair_counts(branch):
+    ev = evaluation(branch)
+    assert len(ev) == sum(PAIR_TOTALS.values())
+    assert ev.kind.value_counts().to_dict() == PAIR_TOTALS
+    assert ev.groupby(["league", "kind"]).size().to_dict() == PAIRS
