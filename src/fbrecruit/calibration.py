@@ -9,8 +9,6 @@ import xgboost as xgb
 from scipy.stats import spearmanr
 from sklearn.linear_model import LogisticRegression
 from sklearn.metrics import brier_score_loss, log_loss
-from socceraction.spadl import add_names
-from socceraction.vaep import formula
 
 from fbrecruit import actionvalue as av
 from fbrecruit import minutes
@@ -300,9 +298,8 @@ def load_calibrators():
 
 
 def same_bins(raw, cal):
-    """Bin membership under the qcut call of actionvalue.reliability."""
-    q = lambda p: pd.qcut(p, 10, labels=False, duplicates="drop")  # noqa: E731
-    return np.array_equal(q(raw), q(cal))
+    """Bin membership under the binning of actionvalue.reliability."""
+    return np.array_equal(av.qbins(raw), av.qbins(cal))
 
 
 def evaluation(branch, name, window, lb, y, raw, pc):
@@ -383,44 +380,13 @@ def full_probs(branch, league, cals=None):
     return p
 
 
-def rate(league, p):
-    """actionvalue.action_values with the given probabilities: formula.value per game."""
-    actions = add_names(av.load(league, "actions"))
-    av.check_keys(actions, p)
-    frames = []
-    for idx in actions.groupby("game_id", sort=False).indices.values():
-        a = actions.iloc[idx].reset_index(drop=True)
-        g = p.iloc[idx].reset_index(drop=True)
-        v = formula.value(a, g.p_scores.astype(float), g.p_concedes.astype(float))
-        frames.append(pd.concat([a[["game_id", "player_id", "team_id"]], v], axis=1))
-    return pd.concat(frames, ignore_index=True).assign(league=league)
-
-
-def player_window_table(name, values, lineups, wins, mins):
-    """actionvalue.player_window_table on the given action values."""
-    values = values.merge(wins[["league", "game_id", "window"]], on=["league", "game_id"])
-    values["player_id"] = values.player_id.astype("int64")
-    keys = ["league", "player_id", "team_id", "window"]
-    sums = values.groupby(keys, as_index=False).agg(
-        vaep_sum=("vaep_value", "sum"),
-        offensive_sum=("offensive_value", "sum"),
-        defensive_sum=("defensive_value", "sum"),
+def calibrated_table(name, branch, cals, lineups, wins, mins):
+    """Player-window table built from one branch's probabilities, calibrated if cals is given."""
+    values = pd.concat(
+        [av.action_values(branch, lg, full_probs(branch, lg, cals)) for lg in LEAGUES],
+        ignore_index=True,
     )
-    lineup_keys = mins[keys].assign(team_id=mins.team_id.astype("int64"))
-    orphan = sums.merge(lineup_keys, on=keys, how="left", indicator=True)
-    orphan = orphan[orphan._merge == "left_only"]
-    print(f"{name}: action sums with no lineup row {len(orphan)}, vaep {orphan.vaep_sum.sum():.4f}")
-    names = lineups.drop_duplicates(minutes.TEAM_KEYS)[[*minutes.TEAM_KEYS, "player_name"]]
-    table = mins.assign(team_id=mins.team_id.astype("int64")).merge(sums, on=keys, how="left")
-    table = table.merge(
-        names.assign(team_id=names.team_id.astype("int64")),
-        on=["league", "season", "team_id", "player_id"],
-    )
-    table[["vaep_sum", "offensive_sum", "defensive_sum"]] = table[
-        ["vaep_sum", "offensive_sum", "defensive_sum"]
-    ].fillna(0.0)
-    print(f"{name}: rows with 0 window minutes, excluded {int((table.minutes == 0).sum())}")
-    return av.per90(table)[av.TABLE_COLUMNS].sort_values(keys).reset_index(drop=True)
+    return av.player_window_table(name, lineups, wins, mins, values=values)
 
 
 def check_against(old, new):
@@ -463,13 +429,11 @@ def tables():
 
     new = {}
     for b in BRANCHES:
-        values = pd.concat([rate(lg, full_probs(b, lg, cals)) for lg in LEAGUES], ignore_index=True)
-        new[b] = player_window_table(f"{b} calibrated", values, lineups, wins, mins)
+        new[b] = calibrated_table(f"{b} calibrated", b, cals, lineups, wins, mins)
         print(f"\n7c: {b} rows per league and window")
         check_against(existing[b], new[b])
         new[b].to_parquet(PROCESSED / f"player_window_vaep_{b}_cal.parquet", index=False)
-    values = pd.concat([rate(lg, full_probs("pooled", lg)) for lg in LEAGUES], ignore_index=True)
-    uncal = player_window_table("pooled out-of-fold uncalibrated", values, lineups, wins, mins)
+    uncal = calibrated_table("pooled out-of-fold uncalibrated", "pooled", None, lineups, wins, mins)
 
     sets = {
         "existing pooled": existing["pooled"],

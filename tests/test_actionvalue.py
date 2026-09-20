@@ -6,14 +6,18 @@ from fbrecruit.actionvalue import (
     COLUMNS,
     FITS,
     Rows,
+    action_values,
     labels_path,
     per90,
+    player_window_table,
+    pred_path,
     rating_fit,
     train_labels,
     window_minutes,
 )
-from fbrecruit.minutes import TEAM_KEYS, aggregate
+from fbrecruit.minutes import TEAM_KEYS, aggregate, load_lineups
 from fbrecruit.paths import PROCESSED
+from fbrecruit.split import windows
 
 LABEL_COUNTS = {
     # league: (rows, scores positives, concedes positives)
@@ -157,3 +161,17 @@ def test_player_window_table_rows(kind):
     for league, (w1, w2) in TABLE_ROWS.items():
         assert (counts[(league, 1)], counts[(league, 2)]) == (w1, w2)
     assert (table.minutes > 0).all()
+
+
+@pytest.mark.slow
+def test_la_liga_rows_rebuild_through_the_shared_path():
+    """Rating and aggregation given values must reproduce the stored table's La Liga rows."""
+    stored = pd.read_parquet(need(PROCESSED / "player_window_vaep_pooled.parquet"))
+    need(pred_path("pooled", "la_liga"))
+    wins = windows()
+    lineups = load_lineups("statsbomb")
+    mins = window_minutes(lineups, wins)
+    values = action_values("pooled", "la_liga")
+    table = player_window_table("pooled", lineups, wins, mins, values=values)
+    rebuilt = table[table.league == "la_liga"].reset_index(drop=True)
+    assert rebuilt.equals(stored[stored.league == "la_liga"].reset_index(drop=True))

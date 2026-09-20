@@ -224,9 +224,14 @@ def evaluation_rows(name, league, window):
     return p[keep].reset_index(drop=True), y[keep].reset_index(drop=True)
 
 
+def qbins(p, n=10):
+    """Equal-count bin index of the predicted probability."""
+    return pd.qcut(p, n, labels=False, duplicates="drop")
+
+
 def reliability(y, p, bins=10):
     """Equal-count bins of the predicted probability."""
-    q = pd.qcut(p, bins, labels=False, duplicates="drop")
+    q = qbins(p, bins)
     d = pd.DataFrame({"bin": q, "y": y, "p": p}).groupby("bin")
     return d.agg(count=("y", "size"), mean_predicted=("p", "mean"), observed=("y", "mean"))
 
@@ -277,11 +282,15 @@ def determinism():
     print(f"predictions identical {np.array_equal(*preds)}, max abs difference {diff!r}")
 
 
-def action_values(kind, league):
-    """VAEP values of every action in a league, rated per game."""
+def action_values(kind, league, p=None):
+    """VAEP values of every action in a league, rated per game.
+
+    Probabilities default to the stored predictions of the fit the leakage rule picks.
+    """
     actions = add_names(load(league, "actions"))
-    p = pd.read_parquet(pred_path(rating_fit(kind, league), league))
-    assert (actions[KEYS].to_numpy() == p[KEYS].to_numpy()).all()
+    if p is None:
+        p = pd.read_parquet(pred_path(rating_fit(kind, league), league))
+    check_keys(actions, p)
     frames = []
     for idx in actions.groupby("game_id", sort=False).indices.values():
         a = actions.iloc[idx].reset_index(drop=True)
@@ -310,8 +319,10 @@ TABLE_COLUMNS = [
 ]  # fmt: skip
 
 
-def player_window_table(kind, lineups, wins, mins):
-    values = pd.concat([action_values(kind, lg) for lg in LEAGUES], ignore_index=True)
+def player_window_table(kind, lineups, wins, mins, values=None):
+    """Kind names the rating in the printed lines; values default to that kind's action values."""
+    if values is None:
+        values = pd.concat([action_values(kind, lg) for lg in LEAGUES], ignore_index=True)
     values = values.merge(wins[["league", "game_id", "window"]], on=["league", "game_id"])
     values["player_id"] = values.player_id.astype("int64")
     keys = ["league", "player_id", "team_id", "window"]
