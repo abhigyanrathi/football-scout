@@ -86,3 +86,13 @@ Reason: Miscalibration is league-specific (concedes under-predicted by 13% to 15
 Decision: Pooled window-1 action values come from calibrated out-of-fold predictions and window-2 values from the calibrated pooled model; the uncalibrated tables are kept and the calibrated tables are written beside them.
 Alternatives considered: calibrating the pooled model's own window-1 predictions; replacing the uncalibrated tables.
 Reason: The pooled model trained on every window-1 row, so its window-1 predictions are in-sample (window-1 log loss in-sample against out-of-fold: scores 0.039959 against 0.046413, concedes 0.009418 against 0.013928), and a calibrator learned on out-of-sample predictions does not describe them.
+
+## 2026-09-20: Calibration fit at depth 6
+Decision: Compare classifier depth 6 with depth 3, under a rule fixed in advance, before building on calibrated values.
+Alternatives considered: keeping the depth-6 two-parameter calibration as it is; a more flexible calibration map.
+Reason: On its own fit rows, the two-parameter map leaves the depth-6 concedes probabilities with an S-shaped residual (window 1, all four leagues: the lowest four deciles under-predicted by 16% to 65%, the sixth to ninth deciles over-predicted by 10% to 31%), and the lowest two scores deciles under-predicted by 38% and 25%. Well-calibrated league maps would give a well-calibrated mixture, so the residual comes from the map's shape. Near zero the map behaves like p raised to a power below one, which steepens differences between small probabilities, and action values are built from those differences.
+
+## 2026-09-20: Classifier depth
+Decision: Scores use depth 3 and concedes use depth 3, chosen by a rule fixed before the comparison: for each label, depth 3 replaces depth 6 if its calibrated window-1 out-of-fold log loss is no higher and its Hosmer-Lemeshow statistic is lower (ten equal-count bins, all four leagues together); depth 6 stays if it is no worse on both. Only the tree depth changes. The depth is chosen once, by window-1 cross-validation across all four leagues, and used for every model of that label, including leave-one-league-out; no model or choice uses window 2. The depth-6 models, predictions and tables are kept. This amends the entry "Leakage-safe action values".
+Alternatives considered: depth 6 for scores; depth 6 for concedes.
+Reason: Calibrated window-1 out-of-fold log loss, depth 6 against depth 3: scores 0.046221 against 0.045498, concedes 0.013728 against 0.013315; Hosmer-Lemeshow: scores 104.43 against 14.20, concedes 303.92 against 48.45. Depth 6 overfits (window-1 log loss in-sample against out-of-fold: 0.039959 against 0.046413 for scores, 0.009418 against 0.013928 for concedes), and depth 3 is socceraction's default.
