@@ -1,16 +1,30 @@
 import numpy as np
 import pandas as pd
 import pytest
-from sklearn.metrics import brier_score_loss
+import xgboost as xgb
+from sklearn.metrics import brier_score_loss, log_loss
 
-from fbrecruit.actionvalue import labels_path, pred_path
+from fbrecruit.actionvalue import PARAMS, labels_path, model_path, pred_path, train_labels
 from fbrecruit.calibration import (
     CALIBRATORS_PATH,
+    CALIBRATORS_V2_PATH,
+    CHOSEN_DEPTH,
+    DEPTH3,
+    DEPTHS,
     FOLDS_PATH,
     apply,
     assign_folds,
+    branch_calibrators,
+    choose_depth,
     fit_calibrator,
+    fold_fit,
+    fold_parts,
+    full_fit_parts,
+    hl,
+    hl_from_bins,
     load_calibrators,
+    load_calibrators_v2,
+    oof_path,
     raw_rows,
     spread,
 )
@@ -25,6 +39,63 @@ FOLDS = {
     "ligue_1": [(46, 96082), (46, 91854), (46, 90274), (45, 91011), (45, 91927)],
 }
 TRAINING_ROWS = [1464307, 1465590, 1469183, 1466990, 1464898]
+D3_FOLDS = {
+    # fold: (training rows, scores positives, concedes positives) of the depth-3 fold fits
+    0: (1464307, 15274, 3148),
+    1: (1465590, 15144, 3178),
+    2: (1469183, 15344, 3144),
+    3: (1466990, 15030, 3102),
+    4: (1464898, 15144, 3140),
+}
+D3_FITS = {
+    # fit: (window-1 rows, scores positives, concedes positives) of the depth-3 full fits
+    "pooled_d3": (1832742, 18984, 3928),
+    "lolo_la_liga_d3": (1377513, 14032, 2843),
+    "lolo_premier_league_d3": (1376320, 14119, 2996),
+    "lolo_serie_a_d3": (1372799, 14213, 2969),
+    "lolo_ligue_1_d3": (1371594, 14588, 2976),
+}
+CALIBRATORS_V2 = {
+    # (branch, league, label): (a, b) of the depth-3 maps in calibrators_v2.json
+    ("pooled", "la_liga", "scores"): (-0.019245307527331213, 0.9899982264667503),
+    ("pooled", "la_liga", "concedes"): (-0.5309204539247586, 0.8850941519612973),
+    ("pooled", "premier_league", "scores"): (-0.10720278767552069, 0.9773347930685863),
+    ("pooled", "premier_league", "concedes"): (-0.1685680516123911, 0.9756993088068241),
+    ("pooled", "serie_a", "scores"): (-0.06983551228102684, 0.9796839853068271),
+    ("pooled", "serie_a", "concedes"): (-0.10638775790320669, 0.9848921752643033),
+    ("pooled", "ligue_1", "scores"): (-0.04686624356280626, 0.9943349951667653),
+    ("pooled", "ligue_1", "concedes"): (-0.25635621263239516, 0.9565132502542538),
+    ("lolo", "la_liga", "scores"): (-0.0017143319858387161, 0.9916922084414593),
+    ("lolo", "la_liga", "concedes"): (-0.6047376123932015, 0.8647864219457059),
+    ("lolo", "premier_league", "scores"): (-0.09692690628817996, 0.9795364776895195),
+    ("lolo", "premier_league", "concedes"): (-0.12975704233516433, 0.9850054351100231),
+    ("lolo", "serie_a", "scores"): (-0.11736763056789118, 0.9667255851422482),
+    ("lolo", "serie_a", "concedes"): (-0.1158859508621106, 0.9850269718541976),
+    ("lolo", "ligue_1", "scores"): (-0.07859380027059731, 0.9886300863037576),
+    ("lolo", "ligue_1", "concedes"): (-0.28735525448755694, 0.9522342723622889),
+}
+MEAN_PER90_V2 = {
+    # branch: league: (window 1, window 2) mean vaep_per90, players with 450+ season minutes
+    "pooled": {
+        "la_liga": (0.1264677305402946, 0.14152926903740293),
+        "premier_league": (0.1337310329570588, 0.14882826922072678),
+        "serie_a": (0.1281099262381467, 0.12153073976259891),
+        "ligue_1": (0.12271133497454073, 0.11808856102064773),
+    },
+    "lolo": {
+        "la_liga": (0.12990725538262868, 0.14628633911776615),
+        "premier_league": (0.13215737275672215, 0.14876324886370007),
+        "serie_a": (0.12825221899358855, 0.11920681108581956),
+        "ligue_1": (0.12321316766530088, 0.11861111323061718),
+    },
+}
+RULE_INPUTS = {
+    # (depth, label): calibrated window-1 out-of-fold log loss and HL, all four leagues together
+    (6, "scores"): (0.04622119296540145, 104.43198837667217),
+    (3, "scores"): (0.045498255518671975, 14.195057669326065),
+    (6, "concedes"): (0.013727663363752004, 303.92490264622165),
+    (3, "concedes"): (0.013314749998694978, 48.453689532588456),
+}
 CALIBRATORS = {
     # (branch, league, label): (a, b)
     ("pooled", "la_liga", "scores"): (-0.5250137788485826, 0.8578776438160345),
@@ -194,3 +265,121 @@ def test_calibrated_table_rows_and_means(branch):
     means = spread(table, regular)["mean"]
     for lg, (w1, w2) in MEAN_PER90[branch].items():
         assert (means[(lg, 1)], means[(lg, 2)]) == (w1, w2)
+
+
+def test_hl_on_a_hand_built_table():
+    # Three bins of 100 rows, with (O, E) of (10, 8), (20, 25) and (30, 30):
+    #   (10 - 8)^2  / (8  * (1 - 8/100))  = 4 / 7.36
+    #   (20 - 25)^2 / (25 * (1 - 25/100)) = 25 / 18.75
+    #   (30 - 30)^2 / (30 * (1 - 30/100)) = 0
+    g = pd.DataFrame({"n": [100, 100, 100], "o": [10, 20, 30], "e": [8.0, 25.0, 30.0]})
+    assert hl_from_bins(g) == pytest.approx(4 / 7.36 + 25 / 18.75, rel=1e-12)
+
+
+@pytest.mark.parametrize(
+    ("ll6", "hl6", "ll3", "hl3", "expected"),
+    [
+        (0.05, 300.0, 0.04, 200.0, 3),
+        (0.05, 300.0, 0.05, 200.0, 3),
+        (0.04, 200.0, 0.05, 300.0, 6),
+        (0.05, 300.0, 0.05, 300.0, 6),
+        (0.05, 300.0, 0.04, 400.0, "mixed"),
+        (0.05, 300.0, 0.06, 200.0, "mixed"),
+    ],
+)
+def test_depth_rule(ll6, hl6, ll3, hl3, expected):
+    assert choose_depth(ll6, hl6, ll3, hl3) == expected
+
+
+def test_depth3_dict_is_params_plus_max_depth():
+    assert PARAMS == {
+        "objective": "binary:logistic",
+        "tree_method": "hist",
+        "random_state": 0,
+        "n_jobs": 16,
+    }
+    assert "max_depth" not in PARAMS
+    assert DEPTH3 == PARAMS | {"max_depth": 3}
+
+
+@pytest.mark.slow
+@pytest.mark.parametrize("k", sorted(D3_FOLDS))
+def test_depth3_fold_training_rows_and_positives(k):
+    need(FOLDS_PATH)
+    y = train_labels(fold_parts(k, inside=False))
+    assert (len(y), int(y.scores.sum()), int(y.concedes.sum())) == D3_FOLDS[k]
+
+
+@pytest.mark.slow
+@pytest.mark.parametrize("name", D3_FITS)
+def test_depth3_full_fit_training_rows_and_positives(name):
+    y = train_labels(full_fit_parts(name))
+    assert (len(y), int(y.scores.sum()), int(y.concedes.sum())) == D3_FITS[name]
+
+
+@pytest.mark.slow
+@pytest.mark.parametrize("label", ["scores", "concedes"])
+def test_depth3_models_have_depth_three_trees(label):
+    # A saved model does not carry the training max_depth, so the trees are the only evidence:
+    # a tree of depth 3 holds at most 15 nodes, one of depth 6 up to 127.
+    for name in [fold_fit(k, d3=True) for k in D3_FOLDS] + list(D3_FITS):
+        booster = xgb.Booster(model_file=need(model_path(name, label)))
+        assert booster.trees_to_dataframe().groupby("Tree").size().max() <= 15
+
+
+@pytest.mark.slow
+def test_depth3_pooled_calibrators():
+    for lg in LEAGUES:
+        need(oof_path(lg, d3=True))
+    cals = branch_calibrators("pooled", True)
+    for (branch, lg, lb), (a, b) in CALIBRATORS_V2.items():
+        if branch == "pooled":
+            assert (cals[(lg, lb)]["a"], cals[(lg, lb)]["b"]) == (a, b)
+
+
+@pytest.mark.slow
+def test_calibrators_v2_entries():
+    need(CALIBRATORS_V2_PATH)
+    cals = load_calibrators_v2()
+    assert len(cals) == 16
+    for key, (a, b) in CALIBRATORS_V2.items():
+        c = cals[key]
+        assert (c["a"], c["b"], c["depth"]) == (a, b, CHOSEN_DEPTH[key[2]])
+
+
+@pytest.mark.slow
+@pytest.mark.parametrize("branch", ["pooled", "lolo"])
+def test_v2_table_rows_and_means(branch):
+    table = pd.read_parquet(need(PROCESSED / f"player_window_vaep_{branch}_v2.parquet"))
+    counts = table.groupby(["league", "window"]).size()
+    for lg, (w1, w2) in TABLE_ROWS.items():
+        assert (counts[(lg, 1)], counts[(lg, 2)]) == (w1, w2)
+    players = pd.read_parquet(need(PROCESSED / "minutes_player_statsbomb.parquet"))
+    regular = players[players.minutes >= 450][["league", "player_id"]]
+    means = spread(table, regular)["mean"]
+    for lg, (w1, w2) in MEAN_PER90_V2[branch].items():
+        assert (means[(lg, 1)], means[(lg, 2)]) == (w1, w2)
+
+
+@pytest.mark.slow
+def test_depth_rule_inputs_and_outcome():
+    """The rule's inputs, recomputed, and the depth it picks for each label."""
+    for d3 in DEPTHS.values():
+        for lg in LEAGUES:
+            need(oof_path(lg, d3))
+    values = {}
+    for depth, d3 in DEPTHS.items():
+        cals = branch_calibrators("pooled", d3)
+        for label in ["scores", "concedes"]:
+            ys, ps = [], []
+            for lg in LEAGUES:
+                p, y = raw_rows("pooled", lg, 1, d3)
+                ys.append(y[label].to_numpy().astype(int))
+                ps.append(apply(cals[(lg, label)], p[f"p_{label}"].to_numpy().astype(float)))
+            y, pc = np.concatenate(ys), np.concatenate(ps)
+            values[(depth, label)] = (log_loss(y, pc, labels=[0, 1]), hl(y, pc))
+            assert values[(depth, label)] == RULE_INPUTS[(depth, label)]
+    for label in ["scores", "concedes"]:
+        ll6, hl6 = values[(6, label)]
+        ll3, hl3 = values[(3, label)]
+        assert choose_depth(ll6, hl6, ll3, hl3) == CHOSEN_DEPTH[label]

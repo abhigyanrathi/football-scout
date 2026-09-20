@@ -176,9 +176,10 @@ def train_labels(parts):
     return pd.concat(frames, ignore_index=True)
 
 
-def fit(name, labels=LABELS, save=True, parts=None):
+def fit(name, labels=LABELS, save=True, parts=None, params=None):
     """Parts are (league, window number or set of game ids); the default is the fit's window 1."""
     parts = parts or [(lg, 1) for lg in FITS[name]]
+    params = params or PARAMS
     y = train_labels(parts)
     start = time.perf_counter()
     rows = Rows(parts, y)
@@ -193,7 +194,7 @@ def fit(name, labels=LABELS, save=True, parts=None):
     for label in labels:
         dm.set_label(y[label].to_numpy())
         t = time.perf_counter()
-        boosters[label] = xgb.train(PARAMS, dm, ROUNDS, verbose_eval=False)
+        boosters[label] = xgb.train(params, dm, ROUNDS, verbose_eval=False)
         secs = time.perf_counter() - t
         print(
             f"{label}: positives {int(y[label].sum())}, base rate {y[label].mean():.6f}, "
