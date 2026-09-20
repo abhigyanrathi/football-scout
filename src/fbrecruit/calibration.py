@@ -562,12 +562,17 @@ def full_probs(branch, league, cals=None):
     return p
 
 
-def calibrated_table(name, branch, cals, lineups, wins, mins):
-    """Player-window table built from one branch's probabilities, calibrated if cals is given."""
-    values = pd.concat(
-        [av.action_values(branch, lg, full_probs(branch, lg, cals)) for lg in LEAGUES],
+def branch_values(branch, probs):
+    """Per-action values of all four leagues, rated from each league's probability frame."""
+    return pd.concat(
+        [av.action_values(branch, lg, probs[lg]) for lg in LEAGUES],
         ignore_index=True,
     )
+
+
+def calibrated_table(name, branch, cals, lineups, wins, mins):
+    """Player-window table built from one branch's probabilities, calibrated if cals is given."""
+    values = branch_values(branch, {lg: full_probs(branch, lg, cals) for lg in LEAGUES})
     return av.player_window_table(name, lineups, wins, mins, values=values)
 
 
@@ -830,10 +835,8 @@ def tables_v2(chosen):
 
     new = {}
     for b in BRANCHES:
-        values = pd.concat(
-            [av.action_values(b, lg, full_probs_v2(b, lg, cals, chosen)) for lg in LEAGUES],
-            ignore_index=True,
-        )
+        probs = {lg: full_probs_v2(b, lg, cals, chosen) for lg in LEAGUES}
+        values = branch_values(b, probs)
         new[b] = av.player_window_table(f"{b} v2", lineups, wins, mins, values=values)
         print(f"\n5f: {b} rows per league and window")
         check_against(existing[b], new[b])

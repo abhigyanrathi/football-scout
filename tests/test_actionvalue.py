@@ -167,11 +167,11 @@ def test_player_window_table_rows(kind):
 def test_la_liga_rows_rebuild_through_the_shared_path():
     """Rating and aggregation given values must reproduce the stored table's La Liga rows."""
     stored = pd.read_parquet(need(PROCESSED / "player_window_vaep_pooled.parquet"))
-    need(pred_path("pooled", "la_liga"))
+    p = pd.read_parquet(need(pred_path("pooled", "la_liga")))
     wins = windows()
     lineups = load_lineups("statsbomb")
     mins = window_minutes(lineups, wins)
-    values = action_values("pooled", "la_liga")
+    values = action_values("pooled", "la_liga", p)
     table = player_window_table("pooled", lineups, wins, mins, values=values)
     rebuilt = table[table.league == "la_liga"].reset_index(drop=True)
     assert rebuilt.equals(stored[stored.league == "la_liga"].reset_index(drop=True))
