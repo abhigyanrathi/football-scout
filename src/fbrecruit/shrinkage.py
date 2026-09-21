@@ -10,6 +10,7 @@ from scipy.stats import rankdata
 from fbrecruit import actionvalue as av
 from fbrecruit import calibration as cal
 from fbrecruit import minutes
+from fbrecruit.logs import Tee, key, show
 from fbrecruit.paths import INTERIM, PROCESSED
 from fbrecruit.sources.statsbomb import LEAGUES
 from fbrecruit.split import windows
@@ -24,6 +25,7 @@ W1_MINUTES = 450
 W2_MINUTES = 270
 KEYS = ["league", "player_id", "team_id"]
 COMPONENTS = {"total": "vaep_value", "offensive": "offensive_value", "defensive": "defensive_value"}
+SUMS = {"total": "vaep_sum", "offensive": "offensive_sum", "defensive": "defensive_sum"}
 PREDICTORS = ["P0", "P1", "P2", "P3", "P4"]
 VARIANTS = {"slope": True, "no_slope": False}
 REPLICATES = 2000
@@ -87,38 +89,6 @@ def shrinkage_path(branch):
 
 def bootstrap_path(branch):
     return PROCESSED / f"bootstrap_{branch}.parquet"
-
-
-class Tee:
-    """Everything to the full log; lines printed through key() reach the summary log as well."""
-
-    def __init__(self, full, brief):
-        self.full = full
-        self.brief = brief
-        self.echo = False
-
-    def write(self, text):
-        self.full.write(text)
-        if self.echo:
-            self.brief.write(text)
-
-    def flush(self):
-        self.full.flush()
-        self.brief.flush()
-
-
-def key(*args, **kwargs):
-    """Print to the full log and, when one is open, to the summary log as well."""
-    tee = sys.stdout if isinstance(sys.stdout, Tee) else None
-    if tee is not None:
-        tee.echo = True
-    print(*args, **kwargs)
-    if tee is not None:
-        tee.echo = False
-
-
-def show(frame, decimals=6):
-    return frame.to_string(float_format=lambda v: f"{v:.{decimals}f}")
 
 
 # ---------------------------------------------------------------- step 1: preflight
@@ -549,25 +519,29 @@ def report_fits(branch, fits):
             )
 
 
-def reliability(branch, phi, fits):
-    """3f, printed here: tau^2 / (tau^2 + psi) at 450 and 900 minutes, tau^2 from 4a."""
+def reliability(branch, pop, phi, fits):
+    """Each component's own p = 5 fit, and tau^2 / (tau^2 + psi) at 450 and 900 minutes."""
     rows = []
-    for g, f in sorted(fits["slope"].items()):
-        if f is None:
+    league = pop.league.to_numpy()
+    mins = pop.minutes.to_numpy(dtype=float)
+    for g, idx in sorted(pop.groupby("group").indices.items()):
+        x = design(league[idx], mins[idx], True)
+        if len(idx) <= x.shape[1]:
             continue
         for comp in COMPONENTS:
-            for mins in (450, 900):
-                psi = PER90 * phi.loc[g, f"phi_{comp}"] / mins
-                rows.append(
-                    {"group": g, "component": comp, "minutes": mins, "psi": psi}
-                    | {"tau2": f["tau2"], "reliability": f["tau2"] / (f["tau2"] + psi)}
-                )
-    t = pd.DataFrame(rows).pivot(
-        index=["group", "component"], columns="minutes", values="reliability"
-    )
-    key(f"\n4d {branch}: reliability tau2 / (tau2 + psi), tau2 from the p = 5 fit")
-    key(show(t, 6))
-    print(show(pd.DataFrame(rows), 8))
+            # the operation order of av.per90, so the total reproduces vaep_per90 bit for bit
+            y = pop[SUMS[comp]].to_numpy(dtype=float)[idx] / mins[idx] * 90
+            phi_g = phi.loc[g, f"phi_{comp}"]
+            f = fay_herriot(y, x, PER90 * phi_g / mins[idx])
+            if comp == "total":
+                assert f["tau2"] == fits["slope"][g]["tau2"], f"{g}: total tau2 differs from 4c"
+            key(f"4d {branch} {g} {comp}: tau2 {f['tau2']!r}, truncated {f['truncated']}")
+            rows.append(
+                {"group": g, "component": comp, "tau2": f["tau2"], "truncated": f["truncated"]}
+                | {f"r_{m}": f["tau2"] / (f["tau2"] + PER90 * phi_g / m) for m in (450, 900)}
+            )
+    key(f"\n4d {branch}: reliability tau2 / (tau2 + psi), each component's own p = 5 fit")
+    key(show(pd.DataFrame(rows).set_index(["group", "component"]), 6))
 
 
 def branch_inputs(branch):
@@ -584,7 +558,7 @@ def fit():
         pop, stats, phi, psi = branch_inputs(branch)
         fits, cols = fit_population(pop, psi)
         report_fits(branch, fits)
-        reliability(branch, phi, fits)
+        reliability(branch, pop, phi, fits)
         out = pop.assign(psi=psi, **cols)
         out.to_parquet(shrinkage_path(branch), index=False)
         key(
