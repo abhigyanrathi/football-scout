@@ -7,15 +7,25 @@ from fbrecruit import graph, style
 NODES = 2073
 KINDS = {"both": 4243, "pass": 3680, "press": 1768}
 LINKS = 9691
-SUMS = {"lolo": -110.78309810208157, "pooled": -336.4133332394995}
+SUMS = {
+    ("lolo", "la_liga"): -471.0080863967887,
+    ("lolo", "ligue_1"): -53.85544741735794,
+    ("lolo", "premier_league"): -371.9579090269399,
+    ("lolo", "serie_a"): -324.7761280443374,
+    ("pooled", None): -254.5694803125225,
+}
 HIDDEN = 969
-AREAS = {"with links": 0.6762783544790465, "without links": 0.7581252043482103}
+AREAS = {
+    0: {"with links": 0.6762783544790465, "without links": 0.7581252043482103},
+    graph.SCORED: {"with links": 0.7676080263184522, "without links": 0.7602477632191327},
+}
+VISIBLE = 0.7913225362927747
 REGULARS = 1401
 SHARES = {
-    1: 0.19664525339043545,
-    2: 0.1809421841541756,
-    3: 0.2190578158458244,
-    4: 0.20835117773019274,
+    1: 0.19628836545324768,
+    2: 0.186366880799429,
+    3: 0.20770877944325483,
+    4: 0.20528194147037832,
 }
 
 
@@ -49,29 +59,41 @@ def test_links_recomputed_from_the_caches():
 def test_pooled_embeddings_recomputed():
     nodes, _, x, linked = inputs()
     need(graph.embeddings_path())
-    z, _ = graph.run(nodes, x, linked, graph.SEED, 0)
+    z, _ = graph.run(nodes, x, linked, graph.SEED, graph.SCORED)
     assert np.array_equal(z, graph.saved_pooled(nodes))
 
 
 @pytest.mark.slow
 def test_saved_embedding_sums():
     e = pd.read_parquet(need(graph.embeddings_path()))
-    assert e.groupby("branch").size().to_dict() == {"lolo": NODES, "pooled": NODES}
-    sums = {b: float(g[graph.E].to_numpy(np.float64).sum()) for b, g in e.groupby("branch")}
+    groups = {
+        (b, None if pd.isna(f) else f): g
+        for (b, f), g in e.groupby(["branch", "fold"], dropna=False)
+    }
+    assert {k: len(g) for k, g in groups.items()} == dict.fromkeys(SUMS, NODES)
+    sums = {k: float(g[graph.E].to_numpy(np.float64).sum()) for k, g in groups.items()}
     assert sums == SUMS
 
 
 @pytest.mark.slow
-def test_hidden_link_areas():
+@pytest.mark.parametrize("share", AREAS)
+def test_hidden_link_areas(share):
     nodes, _, x, linked = inputs()
-    assert graph.hidden_links(nodes, x, linked, 0) == (HIDDEN, AREAS)
+    assert graph.hidden_links(nodes, x, linked, share) == (HIDDEN, AREAS[share])
+
+
+@pytest.mark.slow
+def test_first_run_area_with_the_hidden_links_visible():
+    nodes, _, x, linked = inputs()
+    _, model, hidden, rest, test = graph.hidden_runs(nodes, x, linked, 0)
+    assert graph.visible_area(model, x, hidden, rest, test) == VISIBLE
 
 
 @pytest.mark.slow
 def test_seed_neighbour_shares():
     nodes, _, x, linked = inputs()
     need(graph.embeddings_path())
-    assert graph.neighbour_shares(nodes, x, linked, 0) == (REGULARS, SHARES)
+    assert graph.neighbour_shares(nodes, x, linked, graph.SCORED) == (REGULARS, SHARES)
 
 
 def counts(rows, n):
