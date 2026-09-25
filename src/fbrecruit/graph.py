@@ -1,3 +1,4 @@
+import math
 import sys
 import time
 
@@ -27,11 +28,14 @@ HIDDEN = 32
 DIM = 16
 LR = 0.01
 STEPS = 200
+SCORED = 0.3
 REPORT_AT = [1, 50, 100, 150, 200]
 SEED = 0
 CHECK_SEEDS = [1, 2, 3, 4]
 NEIGHBOURS = 10
 E = [f"e{i}" for i in range(DIM)]
+# the hidden-link areas of the first run, trained with a scored share of 0
+FIRST_AREAS = {"with links": 0.6762783544790465, "without links": 0.7581252043482103}
 
 
 def links_path():
@@ -289,27 +293,40 @@ class Sage(torch.nn.Module):
         return self.conv2(self.conv1(x, edge_index).relu(), edge_index)
 
 
-def train(x, messages, positives, pool, seed):
-    """Full-batch Adam telling the positive pairs from as many pairs drawn from the pool."""
+def split(links, share, rng):
+    """The links scored at one step and the links messages pass along: with a share above 0, a
+    random share of the links, rounded down, and the rest; with a share of 0, all links for both."""
+    if share == 0:
+        return links, links
+    order = rng.permutation(len(links))
+    n = math.floor(share * len(links))
+    return links[order[:n]], links[order[n:]]
+
+
+def train(x, links, pool, seed, share, messages=True):
+    """Full-batch Adam telling the scored links from as many pairs drawn from the pool, passing
+    messages along the other links, or along none."""
     torch.manual_seed(seed)
     rng = np.random.default_rng(seed)
     torch.set_num_threads(1)
     torch.use_deterministic_algorithms(True)
     model = Sage(x.shape[1])
     opt = torch.optim.Adam(model.parameters(), lr=LR)
-    x, edges = torch.from_numpy(x), both_ways(messages)
-    labels = torch.cat([torch.ones(len(positives)), torch.zeros(len(positives))])
+    x = torch.from_numpy(x)
     losses = []
     for _ in range(STEPS):
-        pairs = torch.from_numpy(np.concatenate([positives, negatives(pool, len(positives), rng)]))
-        z = model(x, edges)
+        scored, passed = split(links, share, rng)
+        passed = passed if messages else passed[:0]
+        pairs = torch.from_numpy(np.concatenate([scored, negatives(pool, len(scored), rng)]))
+        labels = torch.cat([torch.ones(len(scored)), torch.zeros(len(scored))])
+        z = model(x, both_ways(passed))
         loss = F.binary_cross_entropy_with_logits((z[pairs[:, 0]] * z[pairs[:, 1]]).sum(1), labels)
         opt.zero_grad()
         loss.backward()
         opt.step()
         losses.append(loss.item())
     assert np.isfinite(losses).all(), "HARD STOP: a loss is not finite"
-    return model, losses
+    return model, {"losses": losses, "positives": len(scored), "messages": len(passed)}
 
 
 def embed(model, x, messages):
@@ -319,7 +336,7 @@ def embed(model, x, messages):
     return z
 
 
-def run(nodes, x, linked, seed, keep=None):
+def run(nodes, x, linked, seed, share, keep=None):
     """Train on the kept rows and the links between them, then embed every row over every link."""
     keep = np.ones(len(nodes), bool) if keep is None else keep
     rows = np.flatnonzero(keep)
@@ -328,9 +345,9 @@ def run(nodes, x, linked, seed, keep=None):
     sub = new[linked[keep[linked[:, 0]] & keep[linked[:, 1]]]]
     pool = unlinked_pairs(nodes.iloc[rows], sub)
     start = time.perf_counter()
-    model, losses = train(x[rows], sub, sub, pool, seed)
+    model, stats = train(x[rows], sub, pool, seed, share)
     z = embed(model, x, linked)
-    info = {"rows": rows, "links": len(sub), "losses": losses}
+    info = {"rows": rows, "links": len(sub)} | stats
     return z, info | {"seconds": time.perf_counter() - start}
 
 
@@ -343,21 +360,22 @@ def graph_inputs():
 def report(name, info):
     loss = ", ".join(f"step {s} {info['losses'][s - 1]!r}" for s in REPORT_AT)
     key(
-        f"{name}: trained on nodes {len(info['rows'])}, links {info['links']}; "
+        f"{name}: trained on nodes {len(info['rows'])}, links {info['links']}; per step positives "
+        f"{info['positives']}, message links {info['messages']}; "
         f"loss {loss}; seconds {info['seconds']:.2f}"
     )
 
 
-def embeddings():
+def embeddings(share):
     nodes, names, x, linked = graph_inputs()
     key(f"3: feature columns {len(names)}: {names}")
     key(f"3: nodes {len(nodes)}, links {len(linked)}")
-    z, info = run(nodes, x, linked, SEED)
+    z, info = run(nodes, x, linked, SEED, share)
     report("3 pooled", info)
     out = {"pooled": z, "lolo": np.full((len(nodes), DIM), np.nan)}
     for lg in LEAGUES:
         held = (nodes.league == lg).to_numpy()
-        z, info = run(nodes, x, linked, SEED, ~held)
+        z, info = run(nodes, x, linked, SEED, share, ~held)
         leaked = int(held[info["rows"]].sum())
         key(f"3 lolo {lg}: held-out rows in the training set {leaked}")
         assert leaked == 0, f"HARD STOP: the {lg} training set holds a {lg} row"
@@ -390,10 +408,10 @@ def saved_pooled(nodes):
     return saved[E].to_numpy()
 
 
-def rerun():
+def rerun(share):
     nodes, _, x, linked = graph_inputs()
     saved = saved_pooled(nodes)
-    fresh, info = run(nodes, x, linked, SEED)
+    fresh, info = run(nodes, x, linked, SEED, share)
     report("4a pooled", info)
     same = np.array_equal(saved, fresh)
     key(f"4a: dtypes saved {saved.dtype}, recomputed {fresh.dtype}, shape {fresh.shape}")
@@ -402,9 +420,17 @@ def rerun():
     assert same, "HARD STOP: the rerun does not reproduce the saved pooled embeddings"
 
 
-def hidden_links(nodes, x, linked):
+def area(z, test):
+    """Area under the ROC curve of the pairs' dot products, the first half of the pairs linked."""
+    z = z.astype(np.float64)
+    n = len(test) // 2
+    return roc_auc_score(np.r_[np.ones(n), np.zeros(n)], (z[test[:, 0]] * z[test[:, 1]]).sum(1))
+
+
+def hidden_runs(nodes, x, linked, share):
     """Area under the ROC curve on a tenth of the links and as many unlinked same-team pairs, all
-    kept out of training, with messages along the remaining links and with none."""
+    kept out of training, with messages along the remaining links and with none. Also returns the
+    network trained with links, the hidden links, the training links and the scored pairs."""
     rng = np.random.default_rng(SEED)
     n = len(linked) // 10
     pool = unlinked_pairs(nodes, linked)
@@ -415,18 +441,27 @@ def hidden_links(nodes, x, linked):
     key(f"4b: links {len(linked)}, unlinked same-team pairs {len(pool)}")
     key(f"4b: training links {len(rest)}, training negative pool {len(train_pool)}")
     test = np.concatenate([linked[hidden], pool[hidden_neg]])
-    truth = np.r_[np.ones(n), np.zeros(n)]
-    aucs = {}
-    for name, messages in (("with links", rest), ("without links", rest[:0])):
+    models, aucs = {}, {}
+    for name, messages in (("with links", True), ("without links", False)):
         start = time.perf_counter()
-        model, losses = train(x, messages, rest, train_pool, SEED)
-        z = embed(model, x, messages).astype(np.float64)
-        aucs[name] = roc_auc_score(truth, (z[test[:, 0]] * z[test[:, 1]]).sum(1))
+        models[name], stats = train(x, rest, train_pool, SEED, share, messages)
+        aucs[name] = area(embed(models[name], x, rest if messages else rest[:0]), test)
         key(
-            f"4b {name}: message links {len(messages)}, positives {len(rest)}, "
-            f"loss at step {STEPS} {losses[-1]!r}, seconds {time.perf_counter() - start:.2f}"
+            f"4b {name}: per step message links {stats['messages']}, positives "
+            f"{stats['positives']}, loss at step {STEPS} {stats['losses'][-1]!r}, "
+            f"seconds {time.perf_counter() - start:.2f}"
         )
-    return n, aucs
+    return aucs, models["with links"], linked[hidden], rest, test
+
+
+def hidden_links(nodes, x, linked, share):
+    aucs, _, hidden, _, _ = hidden_runs(nodes, x, linked, share)
+    return len(hidden), aucs
+
+
+def visible_area(model, x, hidden, rest, test):
+    """The area when the network passes messages along the training links plus the hidden links."""
+    return area(embed(model, x, np.concatenate([rest, hidden])), test)
 
 
 def nearest(z):
@@ -436,30 +471,54 @@ def nearest(z):
     return np.argsort(d, axis=1, kind="stable")[:, :NEIGHBOURS]
 
 
-def neighbour_shares(nodes, x, linked):
+def neighbour_shares(nodes, x, linked, share):
     regular = (nodes.window1_minutes >= sh.W1_MINUTES).to_numpy()
     base = nearest(saved_pooled(nodes)[regular].astype(np.float64))
     shares = {}
     for seed in CHECK_SEEDS:
-        z, info = run(nodes, x, linked, seed)
+        z, info = run(nodes, x, linked, seed, share)
         report(f"4c seed {seed}", info)
         near = nearest(z[regular].astype(np.float64))
         shares[seed] = float((near[:, :, None] == base[:, None, :]).any(2).mean(1).mean())
     return int(regular.sum()), shares
 
 
-def check():
+def check(share):
     nodes, _, x, linked = graph_inputs()
-    n, aucs = hidden_links(nodes, x, linked)
+    n, aucs = hidden_links(nodes, x, linked, share)
     a, b = aucs["with links"], aucs["without links"]
     key(f"\n4b: hidden links {n}, hidden negatives {n}")
     key(f"4b: area under the ROC curve with links {a!r}, without links {b!r}")
     higher = "with links" if a > b else "without links" if b > a else "neither, they are equal"
     key(f"4b: the higher area is {higher}")
-    m, shares = neighbour_shares(nodes, x, linked)
+    m, shares = neighbour_shares(nodes, x, linked, share)
     key("")
     for seed, s in shares.items():
         key(f"4c seed {seed}: mean share of the seed-0 ten nearest neighbours {s!r}, nodes {m}")
+
+
+def diagnose():
+    """The first run, trained with a scored share of 0: its pooled embeddings and hidden-link
+    areas reproduced, then its network with links scored with the hidden links visible."""
+    nodes, _, x, linked = graph_inputs()
+    saved = saved_pooled(nodes)
+    fresh, info = run(nodes, x, linked, SEED, 0)
+    report("(1) pooled", info)
+    same = np.array_equal(saved, fresh)
+    key(f"(1): pooled seed-0 embeddings with share 0 identical to the saved ones: {same}")
+    key(f"(1): largest absolute difference {np.abs(saved - fresh).max()!r}")
+    assert same, "HARD STOP: share 0 does not reproduce the saved pooled embeddings"
+
+    aucs, model, hidden, rest, test = hidden_runs(nodes, x, linked, 0)
+    a, b = aucs["with links"], aucs["without links"]
+    key(f"(2): hidden links {len(hidden)}; area with links {a!r}, without links {b!r}")
+    same = aucs == FIRST_AREAS
+    key(f"(2): both areas equal the first run's: {same}")
+    assert same, "HARD STOP: share 0 does not reproduce the first run's hidden-link areas"
+
+    seen = visible_area(model, x, hidden, rest, test)
+    key(f"(3): message links {len(rest) + len(hidden)}, of them hidden {len(hidden)}")
+    key(f"(3): area with links, hidden links not visible {a!r}, visible {seen!r}")
 
 
 def main(argv):
@@ -472,11 +531,13 @@ def main(argv):
         if step == "links":
             links()
         elif step == "embed":
-            embeddings()
+            embeddings(0)
         elif step == "rerun":
-            rerun()
+            rerun(0)
         elif step == "check":
-            check()
+            check(0)
+        elif step == "diagnose":
+            diagnose()
     finally:
         sys.stdout = sys.__stdout__
         full.close()

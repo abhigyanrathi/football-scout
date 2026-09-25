@@ -49,7 +49,7 @@ def test_links_recomputed_from_the_caches():
 def test_pooled_embeddings_recomputed():
     nodes, _, x, linked = inputs()
     need(graph.embeddings_path())
-    z, _ = graph.run(nodes, x, linked, graph.SEED)
+    z, _ = graph.run(nodes, x, linked, graph.SEED, 0)
     assert np.array_equal(z, graph.saved_pooled(nodes))
 
 
@@ -64,14 +64,14 @@ def test_saved_embedding_sums():
 @pytest.mark.slow
 def test_hidden_link_areas():
     nodes, _, x, linked = inputs()
-    assert graph.hidden_links(nodes, x, linked) == (HIDDEN, AREAS)
+    assert graph.hidden_links(nodes, x, linked, 0) == (HIDDEN, AREAS)
 
 
 @pytest.mark.slow
 def test_seed_neighbour_shares():
     nodes, _, x, linked = inputs()
     need(graph.embeddings_path())
-    assert graph.neighbour_shares(nodes, x, linked) == (REGULARS, SHARES)
+    assert graph.neighbour_shares(nodes, x, linked, 0) == (REGULARS, SHARES)
 
 
 def counts(rows, n):
@@ -171,9 +171,9 @@ def small_graph():
 
 def test_training_is_reproducible_by_seed():
     nodes, x, linked = small_graph()
-    z, _ = graph.run(nodes, x, linked, 0)
-    again, _ = graph.run(nodes, x, linked, 0)
-    other, _ = graph.run(nodes, x, linked, 1)
+    z, _ = graph.run(nodes, x, linked, 0, 0)
+    again, _ = graph.run(nodes, x, linked, 0, 0)
+    other, _ = graph.run(nodes, x, linked, 1, 0)
     assert np.array_equal(z, again)
     assert not np.array_equal(z, other)
 
