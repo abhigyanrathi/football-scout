@@ -1,8 +1,12 @@
 import sys
+import time
 
 import numpy as np
 import pandas as pd
+import torch
+import torch.nn.functional as F
 from socceraction.spadl import config as spadl
+from torch_geometric.nn import SAGEConv
 
 from fbrecruit import style
 from fbrecruit.logs import Tee, key, show
@@ -17,10 +21,21 @@ TOGETHER_MS = 5000
 PARTNERS = 5
 MIN_COUNT = 3
 KINDS = {"left_only": "pass", "right_only": "press", "both": "both"}
+HIDDEN = 32
+DIM = 16
+LR = 0.01
+STEPS = 200
+REPORT_AT = [1, 50, 100, 150, 200]
+SEED = 0
+E = [f"e{i}" for i in range(DIM)]
 
 
 def links_path():
     return PROCESSED / "graph_links_w1.parquet"
+
+
+def embeddings_path():
+    return PROCESSED / "embeddings_w1.parquet"
 
 
 def in_window1(frame, games):
@@ -218,6 +233,155 @@ def links():
     key(f"\n2: wrote {links_path()} with {len(table)} rows, columns {list(table.columns)}")
 
 
+def features(nodes):
+    """The z_ scores in file order with missing ones at 0, then a one-hot of the group."""
+    z = [c for c in nodes.columns if c.startswith("z_")]
+    # the group table stores a missing group as UNKNOWN
+    groups = sorted(set(nodes.group) - {"UNKNOWN"}) + ["UNKNOWN"]
+    onehot = {f"group_{g}": (nodes.group == g).astype(float) for g in groups}
+    x = nodes[z].fillna(0.0).assign(**onehot)
+    return list(x.columns), np.ascontiguousarray(x.to_numpy(np.float32))
+
+
+def node_pairs(nodes, links):
+    """Row positions of both ends of every link, lower position first."""
+    pos = pd.Series(np.arange(len(nodes)), index=pd.MultiIndex.from_frame(nodes[KEYS]))
+    ends = [pos.loc[pd.MultiIndex.from_frame(end_keys(links, s))].to_numpy() for s in "ab"]
+    return np.sort(np.column_stack(ends), axis=1)
+
+
+def team_pairs(nodes):
+    """Every pair of different nodes on one team, as row positions, lower first."""
+    out = [np.zeros((0, 2), "int64")]
+    for idx in nodes.groupby(["league", "team_id"]).indices.values():
+        i, j = np.triu_indices(len(idx), 1)
+        out.append(np.column_stack([idx[i], idx[j]]))
+    pairs = np.concatenate(out)
+    return pairs[np.lexsort((pairs[:, 1], pairs[:, 0]))]
+
+
+def unlinked_pairs(nodes, linked):
+    pairs = team_pairs(nodes)
+    n = len(nodes)
+    return pairs[~np.isin(pairs[:, 0] * n + pairs[:, 1], linked[:, 0] * n + linked[:, 1])]
+
+
+def negatives(pool, n, rng):
+    return pool[rng.integers(len(pool), size=n)]
+
+
+def both_ways(pairs):
+    return torch.from_numpy(np.ascontiguousarray(np.concatenate([pairs, pairs[:, ::-1]]).T))
+
+
+class Sage(torch.nn.Module):
+    def __init__(self, n_features):
+        super().__init__()
+        self.conv1 = SAGEConv(n_features, HIDDEN)
+        self.conv2 = SAGEConv(HIDDEN, DIM)
+
+    def forward(self, x, edge_index):
+        return self.conv2(self.conv1(x, edge_index).relu(), edge_index)
+
+
+def train(x, messages, positives, pool, seed):
+    """Full-batch Adam telling the positive pairs from as many pairs drawn from the pool."""
+    torch.manual_seed(seed)
+    rng = np.random.default_rng(seed)
+    torch.set_num_threads(1)
+    torch.use_deterministic_algorithms(True)
+    model = Sage(x.shape[1])
+    opt = torch.optim.Adam(model.parameters(), lr=LR)
+    x, edges = torch.from_numpy(x), both_ways(messages)
+    labels = torch.cat([torch.ones(len(positives)), torch.zeros(len(positives))])
+    losses = []
+    for _ in range(STEPS):
+        pairs = torch.from_numpy(np.concatenate([positives, negatives(pool, len(positives), rng)]))
+        z = model(x, edges)
+        loss = F.binary_cross_entropy_with_logits((z[pairs[:, 0]] * z[pairs[:, 1]]).sum(1), labels)
+        opt.zero_grad()
+        loss.backward()
+        opt.step()
+        losses.append(loss.item())
+    assert np.isfinite(losses).all(), "HARD STOP: a loss is not finite"
+    return model, losses
+
+
+def embed(model, x, messages):
+    with torch.no_grad():
+        z = model(torch.from_numpy(x), both_ways(messages)).numpy()
+    assert np.isfinite(z).all(), "HARD STOP: an embedding value is not finite"
+    return z
+
+
+def run(nodes, x, linked, seed, keep=None):
+    """Train on the kept rows and the links between them, then embed every row over every link."""
+    keep = np.ones(len(nodes), bool) if keep is None else keep
+    rows = np.flatnonzero(keep)
+    new = np.full(len(nodes), -1)
+    new[rows] = np.arange(len(rows))
+    sub = new[linked[keep[linked[:, 0]] & keep[linked[:, 1]]]]
+    pool = unlinked_pairs(nodes.iloc[rows], sub)
+    start = time.perf_counter()
+    model, losses = train(x[rows], sub, sub, pool, seed)
+    z = embed(model, x, linked)
+    info = {"rows": rows, "links": len(sub), "losses": losses}
+    return z, info | {"seconds": time.perf_counter() - start}
+
+
+def graph_inputs():
+    nodes = pd.read_parquet(style.player_path())
+    names, x = features(nodes)
+    return nodes, names, x, node_pairs(nodes, pd.read_parquet(links_path()))
+
+
+def report(name, info):
+    loss = ", ".join(f"step {s} {info['losses'][s - 1]!r}" for s in REPORT_AT)
+    key(
+        f"3 {name}: trained on nodes {len(info['rows'])}, links {info['links']}; "
+        f"loss {loss}; seconds {info['seconds']:.2f}"
+    )
+
+
+def pooled_seed0(nodes, x, linked):
+    z, info = run(nodes, x, linked, SEED)
+    report("pooled", info)
+    return z
+
+
+def embeddings():
+    nodes, names, x, linked = graph_inputs()
+    key(f"3: feature columns {len(names)}: {names}")
+    key(f"3: nodes {len(nodes)}, links {len(linked)}")
+    out = {"pooled": pooled_seed0(nodes, x, linked), "lolo": np.full((len(nodes), DIM), np.nan)}
+    for lg in LEAGUES:
+        held = (nodes.league == lg).to_numpy()
+        z, info = run(nodes, x, linked, SEED, ~held)
+        leaked = int(held[info["rows"]].sum())
+        key(f"3 lolo {lg}: held-out rows in the training set {leaked}")
+        assert leaked == 0, f"HARD STOP: the {lg} training set holds a {lg} row"
+        report(f"lolo {lg}", info)
+        out["lolo"][held] = z[held]
+    assert np.isfinite(out["lolo"]).all()
+    table = pd.concat(
+        [
+            pd.concat(
+                [nodes[KEYS].assign(branch=b), pd.DataFrame(z.astype(np.float32), columns=E)],
+                axis=1,
+            )
+            for b, z in out.items()
+        ],
+        ignore_index=True,
+    )
+    table.to_parquet(embeddings_path(), index=False)
+    key(f"\n3: wrote {embeddings_path()} with {len(table)} rows")
+    key(table.dtypes.to_string())
+    norms = table.assign(norm=np.linalg.norm(table[E].to_numpy(np.float64), axis=1))
+    key("\n3: embedding norms per branch (std with ddof 1)")
+    for b, s in norms.groupby("branch").norm:
+        key(f"3 {b}: rows {len(s)}, mean norm {s.mean()!r}, std {s.std()!r}")
+
+
 def main(argv):
     step = argv[0]
     style.LOGS.mkdir(parents=True, exist_ok=True)
@@ -227,6 +391,8 @@ def main(argv):
     try:
         if step == "links":
             links()
+        elif step == "embed":
+            embeddings()
     finally:
         sys.stdout = sys.__stdout__
         full.close()
