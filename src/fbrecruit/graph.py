@@ -162,6 +162,7 @@ def build_links(nodes):
     key(f"2: actions or pressure events from a game outside window 1: {outside}")
     assert outside == 0, "HARD STOP: an action or pressure event is not from a window-1 game"
 
+    a = a.sort_values(["game_id", "period_id", "action_id"], kind="stable").reset_index(drop=True)
     passes = completed_passes(a)
     counts = {"pass": pass_counts(passes), "press": press_counts(press)}
     kept, dropped = {}, {}
