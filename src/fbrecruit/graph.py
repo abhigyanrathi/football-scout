@@ -5,9 +5,11 @@ import numpy as np
 import pandas as pd
 import torch
 import torch.nn.functional as F
+from sklearn.metrics import roc_auc_score
 from socceraction.spadl import config as spadl
 from torch_geometric.nn import SAGEConv
 
+from fbrecruit import shrinkage as sh
 from fbrecruit import style
 from fbrecruit.logs import Tee, key, show
 from fbrecruit.paths import PROCESSED
@@ -27,6 +29,8 @@ LR = 0.01
 STEPS = 200
 REPORT_AT = [1, 50, 100, 150, 200]
 SEED = 0
+CHECK_SEEDS = [1, 2, 3, 4]
+NEIGHBOURS = 10
 E = [f"e{i}" for i in range(DIM)]
 
 
@@ -338,29 +342,25 @@ def graph_inputs():
 def report(name, info):
     loss = ", ".join(f"step {s} {info['losses'][s - 1]!r}" for s in REPORT_AT)
     key(
-        f"3 {name}: trained on nodes {len(info['rows'])}, links {info['links']}; "
+        f"{name}: trained on nodes {len(info['rows'])}, links {info['links']}; "
         f"loss {loss}; seconds {info['seconds']:.2f}"
     )
-
-
-def pooled_seed0(nodes, x, linked):
-    z, info = run(nodes, x, linked, SEED)
-    report("pooled", info)
-    return z
 
 
 def embeddings():
     nodes, names, x, linked = graph_inputs()
     key(f"3: feature columns {len(names)}: {names}")
     key(f"3: nodes {len(nodes)}, links {len(linked)}")
-    out = {"pooled": pooled_seed0(nodes, x, linked), "lolo": np.full((len(nodes), DIM), np.nan)}
+    z, info = run(nodes, x, linked, SEED)
+    report("3 pooled", info)
+    out = {"pooled": z, "lolo": np.full((len(nodes), DIM), np.nan)}
     for lg in LEAGUES:
         held = (nodes.league == lg).to_numpy()
         z, info = run(nodes, x, linked, SEED, ~held)
         leaked = int(held[info["rows"]].sum())
         key(f"3 lolo {lg}: held-out rows in the training set {leaked}")
         assert leaked == 0, f"HARD STOP: the {lg} training set holds a {lg} row"
-        report(f"lolo {lg}", info)
+        report(f"3 lolo {lg}", info)
         out["lolo"][held] = z[held]
     assert np.isfinite(out["lolo"]).all()
     table = pd.concat(
@@ -382,6 +382,85 @@ def embeddings():
         key(f"3 {b}: rows {len(s)}, mean norm {s.mean()!r}, std {s.std()!r}")
 
 
+def saved_pooled(nodes):
+    saved = pd.read_parquet(embeddings_path())
+    saved = saved[saved.branch == "pooled"].reset_index(drop=True)
+    assert saved[KEYS].equals(nodes[KEYS])
+    return saved[E].to_numpy()
+
+
+def rerun():
+    nodes, _, x, linked = graph_inputs()
+    saved = saved_pooled(nodes)
+    fresh, info = run(nodes, x, linked, SEED)
+    report("4a pooled", info)
+    same = np.array_equal(saved, fresh)
+    key(f"4a: dtypes saved {saved.dtype}, recomputed {fresh.dtype}, shape {fresh.shape}")
+    key(f"4a: recomputed pooled seed-0 embeddings identical to the saved ones: {same}")
+    key(f"4a: largest absolute difference {np.abs(saved - fresh).max()!r}")
+    assert same, "HARD STOP: the rerun does not reproduce the saved pooled embeddings"
+
+
+def hidden_links(nodes, x, linked):
+    """Area under the ROC curve on a tenth of the links and as many unlinked same-team pairs, all
+    kept out of training, with messages along the remaining links and with none."""
+    rng = np.random.default_rng(SEED)
+    n = len(linked) // 10
+    pool = unlinked_pairs(nodes, linked)
+    hidden = rng.choice(len(linked), size=n, replace=False)
+    hidden_neg = rng.choice(len(pool), size=n, replace=False)
+    rest = np.delete(linked, hidden, axis=0)
+    train_pool = np.delete(pool, hidden_neg, axis=0)
+    key(f"4b: links {len(linked)}, unlinked same-team pairs {len(pool)}")
+    key(f"4b: training links {len(rest)}, training negative pool {len(train_pool)}")
+    test = np.concatenate([linked[hidden], pool[hidden_neg]])
+    truth = np.r_[np.ones(n), np.zeros(n)]
+    aucs = {}
+    for name, messages in (("with links", rest), ("without links", rest[:0])):
+        start = time.perf_counter()
+        model, losses = train(x, messages, rest, train_pool, SEED)
+        z = embed(model, x, messages).astype(np.float64)
+        aucs[name] = roc_auc_score(truth, (z[test[:, 0]] * z[test[:, 1]]).sum(1))
+        key(
+            f"4b {name}: message links {len(messages)}, positives {len(rest)}, "
+            f"loss at step {STEPS} {losses[-1]!r}, seconds {time.perf_counter() - start:.2f}"
+        )
+    return n, aucs
+
+
+def nearest(z):
+    """Each row's ten nearest other rows by Euclidean distance, ties to the earlier row."""
+    d = np.sqrt(sum((z[:, None, k] - z[None, :, k]) ** 2 for k in range(z.shape[1])))
+    np.fill_diagonal(d, np.inf)
+    return np.argsort(d, axis=1, kind="stable")[:, :NEIGHBOURS]
+
+
+def neighbour_shares(nodes, x, linked):
+    regular = (nodes.window1_minutes >= sh.W1_MINUTES).to_numpy()
+    base = nearest(saved_pooled(nodes)[regular].astype(np.float64))
+    shares = {}
+    for seed in CHECK_SEEDS:
+        z, info = run(nodes, x, linked, seed)
+        report(f"4c seed {seed}", info)
+        near = nearest(z[regular].astype(np.float64))
+        shares[seed] = float((near[:, :, None] == base[:, None, :]).any(2).mean(1).mean())
+    return int(regular.sum()), shares
+
+
+def check():
+    nodes, _, x, linked = graph_inputs()
+    n, aucs = hidden_links(nodes, x, linked)
+    a, b = aucs["with links"], aucs["without links"]
+    key(f"\n4b: hidden links {n}, hidden negatives {n}")
+    key(f"4b: area under the ROC curve with links {a!r}, without links {b!r}")
+    higher = "with links" if a > b else "without links" if b > a else "neither, they are equal"
+    key(f"4b: the higher area is {higher}")
+    m, shares = neighbour_shares(nodes, x, linked)
+    key("")
+    for seed, s in shares.items():
+        key(f"4c seed {seed}: mean share of the seed-0 ten nearest neighbours {s!r}, nodes {m}")
+
+
 def main(argv):
     step = argv[0]
     style.LOGS.mkdir(parents=True, exist_ok=True)
@@ -393,6 +472,10 @@ def main(argv):
             links()
         elif step == "embed":
             embeddings()
+        elif step == "rerun":
+            rerun()
+        elif step == "check":
+            check()
     finally:
         sys.stdout = sys.__stdout__
         full.close()
