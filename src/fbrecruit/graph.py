@@ -372,7 +372,8 @@ def embeddings(share):
     key(f"3: nodes {len(nodes)}, links {len(linked)}")
     z, info = run(nodes, x, linked, SEED, share)
     report("3 pooled", info)
-    out = {"pooled": z, "lolo": np.full((len(nodes), DIM), np.nan)}
+    # every lolo network embeds all rows, stored under the league it held out
+    out = [("pooled", None, z)]
     for lg in LEAGUES:
         held = (nodes.league == lg).to_numpy()
         z, info = run(nodes, x, linked, SEED, share, ~held)
@@ -380,15 +381,17 @@ def embeddings(share):
         key(f"3 lolo {lg}: held-out rows in the training set {leaked}")
         assert leaked == 0, f"HARD STOP: the {lg} training set holds a {lg} row"
         report(f"3 lolo {lg}", info)
-        out["lolo"][held] = z[held]
-    assert np.isfinite(out["lolo"]).all()
+        out.append(("lolo", lg, z))
     table = pd.concat(
         [
             pd.concat(
-                [nodes[KEYS].assign(branch=b), pd.DataFrame(z.astype(np.float32), columns=E)],
+                [
+                    nodes[KEYS].assign(branch=b, fold=f),
+                    pd.DataFrame(z.astype(np.float32), columns=E),
+                ],
                 axis=1,
             )
-            for b, z in out.items()
+            for b, f, z in out
         ],
         ignore_index=True,
     )
@@ -399,6 +402,9 @@ def embeddings(share):
     key("\n3: embedding norms per branch (std with ddof 1)")
     for b, s in norms.groupby("branch").norm:
         key(f"3 {b}: rows {len(s)}, mean norm {s.mean()!r}, std {s.std()!r}")
+    key("\n3: lolo embedding norms per fold (std with ddof 1)")
+    for f, s in norms[norms.branch == "lolo"].groupby("fold").norm:
+        key(f"3 lolo {f}: rows {len(s)}, mean norm {s.mean()!r}, std {s.std()!r}")
 
 
 def saved_pooled(nodes):
@@ -531,11 +537,11 @@ def main(argv):
         if step == "links":
             links()
         elif step == "embed":
-            embeddings(0)
+            embeddings(SCORED)
         elif step == "rerun":
-            rerun(0)
+            rerun(SCORED)
         elif step == "check":
-            check(0)
+            check(SCORED)
         elif step == "diagnose":
             diagnose()
     finally:
