@@ -209,3 +209,21 @@ def test_negatives_are_unlinked_pairs_of_different_nodes_on_one_team():
     assert all(team[a] == team[b] and a != b for a, b in drawn)
     assert not {tuple(p) for p in drawn} & {tuple(p) for p in linked}
     assert len({tuple(p) for p in drawn}) == len(pool)
+
+
+def test_a_share_of_the_links_is_scored_and_messages_pass_along_the_rest():
+    links = np.column_stack([np.arange(23), np.arange(23) + 100])
+    scored, passed = graph.split(links, 0, np.random.default_rng(0))
+    assert np.array_equal(scored, links)
+    assert np.array_equal(passed, links)
+
+    scored, passed = graph.split(links, 0.3, np.random.default_rng(0))
+    assert len(scored) == 6  # 0.3 * 23 = 6.9, rounded down
+    assert len(scored) + len(passed) == len(links)
+    rows = {tuple(p) for p in scored}
+    assert not rows & {tuple(p) for p in passed}
+    assert rows | {tuple(p) for p in passed} == {tuple(p) for p in links}
+
+    again = graph.split(links, 0.3, np.random.default_rng(0))
+    assert np.array_equal(again[0], scored)
+    assert np.array_equal(again[1], passed)

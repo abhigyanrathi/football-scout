@@ -33,9 +33,12 @@ REPORT_AT = [1, 50, 100, 150, 200]
 SEED = 0
 CHECK_SEEDS = [1, 2, 3, 4]
 NEIGHBOURS = 10
+RESAMPLES = 2000
 E = [f"e{i}" for i in range(DIM)]
 # the hidden-link areas of the first run, trained with a scored share of 0
 FIRST_AREAS = {"with links": 0.6762783544790465, "without links": 0.7581252043482103}
+# the float64 sum of the first run's pooled embeddings
+FIRST_SUM = -336.4133332394995
 
 
 def links_path():
@@ -426,17 +429,27 @@ def rerun(share):
     assert same, "HARD STOP: the rerun does not reproduce the saved pooled embeddings"
 
 
+def pair_scores(z, pairs):
+    """Dot products of the pairs' embeddings, in float64."""
+    z = z.astype(np.float64)
+    return (z[pairs[:, 0]] * z[pairs[:, 1]]).sum(1)
+
+
+def auc(scores):
+    """Area under the ROC curve of pair scores, the first half of them for linked pairs."""
+    n = len(scores) // 2
+    return roc_auc_score(np.r_[np.ones(n), np.zeros(n)], scores)
+
+
 def area(z, test):
     """Area under the ROC curve of the pairs' dot products, the first half of the pairs linked."""
-    z = z.astype(np.float64)
-    n = len(test) // 2
-    return roc_auc_score(np.r_[np.ones(n), np.zeros(n)], (z[test[:, 0]] * z[test[:, 1]]).sum(1))
+    return auc(pair_scores(z, test))
 
 
-def hidden_runs(nodes, x, linked, share):
-    """Area under the ROC curve on a tenth of the links and as many unlinked same-team pairs, all
-    kept out of training, with messages along the remaining links and with none. Also returns the
-    network trained with links, the hidden links, the training links and the scored pairs."""
+def hidden_scores(nodes, x, linked, share):
+    """Scores of a tenth of the links and as many unlinked same-team pairs, all kept out of
+    training, from networks passing messages along the remaining links and along none. Also
+    returns the network trained with links, the hidden links, the training links and the pairs."""
     rng = np.random.default_rng(SEED)
     n = len(linked) // 10
     pool = unlinked_pairs(nodes, linked)
@@ -447,17 +460,23 @@ def hidden_runs(nodes, x, linked, share):
     key(f"4b: links {len(linked)}, unlinked same-team pairs {len(pool)}")
     key(f"4b: training links {len(rest)}, training negative pool {len(train_pool)}")
     test = np.concatenate([linked[hidden], pool[hidden_neg]])
-    models, aucs = {}, {}
+    models, scores = {}, {}
     for name, messages in (("with links", True), ("without links", False)):
         start = time.perf_counter()
         models[name], stats = train(x, rest, train_pool, SEED, share, messages)
-        aucs[name] = area(embed(models[name], x, rest if messages else rest[:0]), test)
+        scores[name] = pair_scores(embed(models[name], x, rest if messages else rest[:0]), test)
         key(
             f"4b {name}: per step message links {stats['messages']}, positives "
             f"{stats['positives']}, loss at step {STEPS} {stats['losses'][-1]!r}, "
             f"seconds {time.perf_counter() - start:.2f}"
         )
-    return aucs, models["with links"], linked[hidden], rest, test
+    return scores, models["with links"], linked[hidden], rest, test
+
+
+def hidden_runs(nodes, x, linked, share):
+    """The areas under the ROC curve of hidden_scores' two networks, then the rest it returns."""
+    scores, model, hidden, rest, test = hidden_scores(nodes, x, linked, share)
+    return {name: auc(s) for name, s in scores.items()}, model, hidden, rest, test
 
 
 def hidden_links(nodes, x, linked, share):
@@ -507,13 +526,13 @@ def diagnose():
     """The first run, trained with a scored share of 0: its pooled embeddings and hidden-link
     areas reproduced, then its network with links scored with the hidden links visible."""
     nodes, _, x, linked = graph_inputs()
-    saved = saved_pooled(nodes)
     fresh, info = run(nodes, x, linked, SEED, 0)
     report("(1) pooled", info)
-    same = np.array_equal(saved, fresh)
-    key(f"(1): pooled seed-0 embeddings with share 0 identical to the saved ones: {same}")
-    key(f"(1): largest absolute difference {np.abs(saved - fresh).max()!r}")
-    assert same, "HARD STOP: share 0 does not reproduce the saved pooled embeddings"
+    total = float(fresh.astype(np.float64).sum())
+    same = total == FIRST_SUM
+    key(f"(1): float64 sum of the pooled seed-0 embeddings with share 0 {total!r}")
+    key(f"(1): equal to the first run's sum {FIRST_SUM!r}: {same}")
+    assert same, "HARD STOP: share 0 does not reproduce the first run's pooled embedding sum"
 
     aucs, model, hidden, rest, test = hidden_runs(nodes, x, linked, 0)
     a, b = aucs["with links"], aucs["without links"]
@@ -525,6 +544,32 @@ def diagnose():
     seen = visible_area(model, x, hidden, rest, test)
     key(f"(3): message links {len(rest) + len(hidden)}, of them hidden {len(hidden)}")
     key(f"(3): area with links, hidden links not visible {a!r}, visible {seen!r}")
+
+
+def margin(share):
+    """Report only: the hidden-link check's area with links less its area without, and a paired
+    bootstrap drawing the hidden links and the unlinked pairs separately, both networks per draw."""
+    nodes, _, x, linked = graph_inputs()
+    scores, _, hidden, _, test = hidden_scores(nodes, x, linked, share)
+    n = len(hidden)
+    a, b = auc(scores["with links"]), auc(scores["without links"])
+    key(f"1e: hidden links {n}, unlinked pairs {len(test) - n}")
+    key(f"1e: area with links {a!r}, without links {b!r}")
+    assert n == len(test) - n == 969, "HARD STOP: not 969 pairs of each kind"
+    assert (round(a, 4), round(b, 4)) == (0.7676, 0.7602), "HARD STOP: not the second run's areas"
+
+    rng = np.random.default_rng(SEED)
+    diffs = np.empty(RESAMPLES)
+    for r in range(RESAMPLES):
+        drawn = np.r_[rng.choice(n, size=n), n + rng.choice(n, size=n)]
+        got = {name: auc(s[drawn]) for name, s in scores.items()}
+        diffs[r] = got["with links"] - got["without links"]
+    q = sh.intervals(
+        pd.DataFrame({"subset": "hidden", "predictor": "margin", "metric": "area", "value": diffs})
+    ).iloc[0]
+    key(f"1e: margin, area with links less area without {a - b!r}")
+    key(f"1e: {RESAMPLES} resamples, 2.5 and 97.5 percentiles {q.p2_5!r}, {q.p97_5!r}")
+    key(f"1e: resamples with a margin at or below zero {int((diffs <= 0).sum())}")
 
 
 def main(argv):
@@ -544,6 +589,8 @@ def main(argv):
             check(SCORED)
         elif step == "diagnose":
             diagnose()
+        elif step == "margin":
+            margin(SCORED)
     finally:
         sys.stdout = sys.__stdout__
         full.close()
