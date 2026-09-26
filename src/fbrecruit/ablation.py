@@ -305,15 +305,39 @@ def inputs():
     embedding_seeds()
 
 
+def participation():
+    """Per outfield estimation row: the change in his team's build-up standard score when he is
+    left out, against his share of the team's build-up sequences."""
+    without = pd.read_parquet(without_path(), columns=[*KEYS, "z_buildup"])
+    player = pd.read_parquet(style.player_path(), columns=[*KEYS, "n_buildup"])
+    team = pd.read_parquet(style.team_path(), columns=[*TEAM_KEYS, "z_buildup", "n_buildup"])
+    m = without.merge(player, on=KEYS, how="left", validate="one_to_one").merge(
+        team, on=TEAM_KEYS, how="left", suffixes=("", "_team"), validate="many_to_one"
+    )
+    change = m.z_buildup - m.z_buildup_team
+    share = m.n_buildup / m.n_buildup_team
+    missing = int(change.isna().sum() + share.isna().sum())
+    key(f"1b: outfield estimation rows {len(m)}, missing changes or shares {missing}")
+    assert len(m) == 1299 and missing == 0, "HARD STOP: not 1,299 complete rows"
+    above = int((change > 0).sum())
+    rho = sh.spearman(change.to_numpy(), share.to_numpy())
+    key(f"1b: rows whose team build-up score rises when he is left out {above} of {len(m)}")
+    key(f"1b: change in the team's z_buildup, median {change.median()!r}, largest {change.max()!r}")
+    key(f"1b: Spearman correlation of the change with the share {rho!r}")
+    assert above > len(m) / 2 and rho > 0, "HARD STOP: the shift is not mostly up with the share"
+
+
 def main(argv):
     step = argv[0]
     style.LOGS.mkdir(parents=True, exist_ok=True)
-    full = open(style.LOGS / f"p6a_{step}.log", "w", encoding="utf-8", errors="replace")
-    brief = open(style.LOGS / f"p6a_{step}_summary.log", "w", encoding="utf-8", errors="replace")
+    full = open(style.LOGS / f"p6_{step}.log", "w", encoding="utf-8", errors="replace")
+    brief = open(style.LOGS / f"p6_{step}_summary.log", "w", encoding="utf-8", errors="replace")
     sys.stdout = Tee(full, brief)
     try:
         if step == "inputs":
             inputs()
+        elif step == "participation":
+            participation()
     finally:
         sys.stdout = sys.__stdout__
         full.close()
