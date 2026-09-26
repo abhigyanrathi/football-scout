@@ -369,23 +369,23 @@ def report(name, info):
     )
 
 
-def embeddings(share):
+def embedding_table(share, seed=SEED):
     nodes, names, x, linked = graph_inputs()
     key(f"3: feature columns {len(names)}: {names}")
     key(f"3: nodes {len(nodes)}, links {len(linked)}")
-    z, info = run(nodes, x, linked, SEED, share)
+    z, info = run(nodes, x, linked, seed, share)
     report("3 pooled", info)
     # every lolo network embeds all rows, stored under the league it held out
     out = [("pooled", None, z)]
     for lg in LEAGUES:
         held = (nodes.league == lg).to_numpy()
-        z, info = run(nodes, x, linked, SEED, share, ~held)
+        z, info = run(nodes, x, linked, seed, share, ~held)
         leaked = int(held[info["rows"]].sum())
         key(f"3 lolo {lg}: held-out rows in the training set {leaked}")
         assert leaked == 0, f"HARD STOP: the {lg} training set holds a {lg} row"
         report(f"3 lolo {lg}", info)
         out.append(("lolo", lg, z))
-    table = pd.concat(
+    return pd.concat(
         [
             pd.concat(
                 [
@@ -398,6 +398,10 @@ def embeddings(share):
         ],
         ignore_index=True,
     )
+
+
+def embeddings(share):
+    table = embedding_table(share)
     table.to_parquet(embeddings_path(), index=False)
     key(f"\n3: wrote {embeddings_path()} with {len(table)} rows")
     key(table.dtypes.to_string())
