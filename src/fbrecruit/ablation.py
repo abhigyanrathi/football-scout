@@ -1,13 +1,21 @@
 import sys
+import time
+import warnings
 
 import numpy as np
 import pandas as pd
+from joblib import Parallel, delayed
+from sklearn.exceptions import ConvergenceWarning
+from sklearn.linear_model import ElasticNetCV
+from sklearn.model_selection import GroupKFold
+from sklearn.preprocessing import StandardScaler
 from socceraction.spadl import config as spadl
+from threadpoolctl import threadpool_info, threadpool_limits
 
 from fbrecruit import graph, style
 from fbrecruit import shrinkage as sh
 from fbrecruit.logs import Tee, key, show
-from fbrecruit.paths import PROCESSED
+from fbrecruit.paths import INTERIM, PROCESSED
 from fbrecruit.sources.statsbomb import LEAGUES, OUT
 
 KEYS = sh.KEYS
@@ -24,6 +32,29 @@ PASSES = ["pass", "cross"]
 PER90 = {"np_goal": "np_goals_per90", "np_shot": "np_shots_per90", "assist": "assists_per90"}
 BASIC = ["log_minutes", *PER90.values()]
 SEEDS = [1, 2, 3, 4]
+TEAM_SIDE = [d for d in DIMENSIONS if d != "buildup"]
+C_E = [f"c_{e}" for e in graph.E]
+# each tier adds one family to the tier below, so T1 to T4 are prefixes of T4's columns
+TIERS = {"T1": [*(f"group_{g}" for g in sh.OUTFIELD), *(f"c_{b}" for b in BASIC)]}
+TIERS["T2"] = [*TIERS["T1"], "P3"]
+TIERS["T3"] = [*TIERS["T2"], *(f"c_{z}" for z in Z), *(f"c_team_z_{d}" for d in TEAM_SIDE)]
+TIERS["T4"] = [*TIERS["T3"], *(f"c_fit_{d}" for d in TEAM_SIDE)]
+TIERS["T5"] = [*TIERS["T4"], *C_E]
+BASELINES = ["P0", "P2", "P3"]
+COMPARISONS = [("T1", "P0"), ("T2", "T1"), ("T3", "T2"), ("T4", "T3"), ("T5", "T4"), ("T5", "T2")]
+BRANCHES = sh.BRANCHES
+SUBSETS = ["outfield", *LEAGUES]
+OUTER = 5
+INNER = 5
+ORDER = {"pooled": list(range(OUTER)), "lolo": list(LEAGUES)}
+L1_RATIOS = [0.1, 0.5, 0.7, 0.9, 0.95, 0.99, 1.0]
+REDRAWS = 2000
+PART = 100
+WORKERS = 8
+CHECK_REDRAWS = 16
+LIMIT_S = 6 * 3600
+PASS_AT = 1950
+RECORD = ["replicate", "branch", "subset", "model", "sse", "psi2_sum", "rows"]
 
 
 def without_path():
@@ -36,6 +67,26 @@ def inputs_path():
 
 def seeds_path():
     return PROCESSED / "embeddings_w1_seeds.parquet"
+
+
+def predictions_path():
+    return PROCESSED / "ablation_predictions.parquet"
+
+
+def draws_path():
+    return PROCESSED / "ablation_draws.parquet"
+
+
+def part_path(k):
+    return INTERIM / "ablation_bootstrap" / f"part_{k}.parquet"
+
+
+def bootstrap_path():
+    return PROCESSED / "ablation_bootstrap.parquet"
+
+
+def summary_path():
+    return PROCESSED / "ablation_summary.parquet"
 
 
 def key_set(frame, cols):
@@ -327,6 +378,546 @@ def participation():
     assert above > len(m) / 2 and rho > 0, "HARD STOP: the shift is not mostly up with the share"
 
 
+def pairs():
+    """Per branch, the outfield pairs in key order: target, psi2, P0, P2 and P3 joined to their
+    inputs, with the five group indicators."""
+    inputs = pd.read_parquet(inputs_path())
+    cols = [*KEYS, "group", "target", "psi2", *BASELINES]
+    out = {}
+    for b in BRANCHES:
+        ev = pd.read_parquet(sh.evaluation_path(b), columns=cols)
+        ev = ev[ev.group.isin(sh.OUTFIELD)]
+        m = ev.merge(inputs, on=KEYS, how="left", suffixes=("", "_inputs"), validate="one_to_one")
+        missing = int(m.group_inputs.isna().sum())
+        other = int((m.group_inputs.notna() & (m.group_inputs != m.group)).sum())
+        key(f"2a {b}: outfield pairs {len(m)}, without inputs {missing}, of another group {other}")
+        assert len(m) == 1067 and missing == other == 0, "HARD STOP: a pair has no inputs"
+        indicators = {f"group_{g}": (m.group == g).astype(float) for g in sh.OUTFIELD}
+        out[b] = m.assign(**indicators).sort_values(KEYS).reset_index(drop=True)
+    assert out["pooled"][KEYS].equals(out["lolo"][KEYS]), "the branches' pairs differ"
+    return out
+
+
+def centred_embeddings(table, est, keys):
+    """A table's 16 columns in float64, centred within league and position group by their mean
+    over the outfield estimation rows, for keys' rows; and the largest absolute cell mean of a
+    centred column over those 1,299 rows."""
+    e = est.merge(table[[*KEYS, *graph.E]], on=KEYS, how="left", validate="one_to_one")
+    assert e[graph.E].notna().all().all(), "HARD STOP: an estimation row has no embedding"
+    c = centre(e.astype(dict.fromkeys(graph.E, np.float64)), graph.E).set_axis(C_E, axis=1)
+    worst = float(e[CELL].join(c).groupby(CELL).mean().abs().max().max())
+    rows = keys.merge(e[KEYS].join(c), on=KEYS, how="left", validate="one_to_one")
+    return rows[C_E].to_numpy(), worst
+
+
+def fold_embeddings(table, est, keys, seed):
+    """Per branch and outer fold, the centred embeddings of keys' rows: the pooled network's for
+    every pooled group; for each held-out league, those of the network that held it out."""
+    parts = {"pooled": table[table.branch == "pooled"]}
+    parts |= {lg: table[(table.branch == "lolo") & (table.fold == lg)] for lg in LEAGUES}
+    got = {name: centred_embeddings(t, est, keys) for name, t in parts.items()}
+    worst = {name: g[1] for name, g in got.items()}
+    key(f"2a seed {seed}: largest absolute cell mean over the 1,299 rows, per table {worst}")
+    assert max(worst.values()) <= 1e-12, "HARD STOP: a centred embedding cell mean is not zero"
+    out = {"pooled": dict.fromkeys(ORDER["pooled"], got["pooled"][0])}
+    return out | {"lolo": {lg: got[lg][0] for lg in LEAGUES}}
+
+
+def team_codes(frame):
+    """Each league's team ids, sorted, and a code per team: leagues in LEAGUES order, then id."""
+    teams = {lg: np.sort(frame.team_id[frame.league == lg].unique()) for lg in LEAGUES}
+    order = [(lg, int(t)) for lg in LEAGUES for t in teams[lg]]
+    return teams, {k: i for i, k in enumerate(order)}
+
+
+def fit_data(frames, emb, code):
+    """The arrays a fit needs, in the frames' row order: team codes, leagues, and per branch the
+    inputs of T4, the fold embeddings, target, psi2 and the baselines."""
+    f = frames["pooled"]
+    team = np.array([code[k] for k in zip(f.league, f.team_id, strict=True)])
+    data = {"team": team, "league": f.league.to_numpy()}
+    for b in BRANCHES:
+        d = frames[b]
+        data[b] = {c: d[c].to_numpy(np.float64) for c in ["target", "psi2", *BASELINES]}
+        data[b] |= {"x": d[TIERS["T4"]].to_numpy(np.float64), "emb": emb[b]}
+    return data
+
+
+def deal(teams, rng):
+    """Each league's teams sorted, permuted by rng and dealt in turn to groups 0 to 4, the deal
+    continuing from one league to the next; teams maps each league to its team ids."""
+    group, k = {}, 0
+    for lg in LEAGUES:
+        for t in rng.permutation(np.sort(teams[lg])):
+            group[(lg, int(t))] = k % OUTER
+            k += 1
+    return group
+
+
+def outer_groups(frame, teams):
+    """The pooled outer group of every row: its team's in the deal from seed 0."""
+    group = deal(teams, np.random.default_rng(sh.SEED))
+    g = pd.Series(group, name="group").rename_axis(TEAM_KEYS).reset_index()
+    per = g.groupby(["league", "group"]).size().unstack(fill_value=0).reindex(list(LEAGUES))
+    rows = frame[TEAM_KEYS].merge(g, on=TEAM_KEYS, how="left", validate="many_to_one").group
+    key("2b: teams per league and pooled group")
+    key(per.to_string())
+    key(f"2b: rows per group {rows.value_counts().sort_index().to_dict()}")
+    assert per.shape == (len(LEAGUES), OUTER) and (per == 4).all().all(), "HARD STOP: the deal"
+    return rows.to_numpy()
+
+
+def setup():
+    """The pairs, the outfield estimation rows' keys and groups, the seed-0 fit data, the outer
+    folds of every row, each league's teams and their codes."""
+    frames = pairs()
+    est = pd.read_parquet(inputs_path(), columns=[*KEYS, "group"])
+    teams, code = team_codes(frames["pooled"])
+    table = pd.read_parquet(graph.embeddings_path())
+    data = fit_data(frames, fold_embeddings(table, est, frames["pooled"][KEYS], 0), code)
+    folds = {"pooled": outer_groups(frames["pooled"], teams), "lolo": data["league"]}
+    return frames, est, data, folds, teams, code
+
+
+def inner_folds(teams):
+    """Five inner folds of whole teams, as (training, held-out) row positions; teams are codes."""
+    return list(GroupKFold(n_splits=INNER).split(teams, groups=teams))
+
+
+def fit(x, y, teams):
+    """ElasticNetCV on x rescaled over its own rows, tuned over five inner folds of whole teams;
+    also the numbers of ConvergenceWarnings and of other warnings."""
+    with warnings.catch_warnings(record=True) as caught:
+        warnings.simplefilter("always")
+        scaler = StandardScaler().fit(x)
+        model = ElasticNetCV(l1_ratio=L1_RATIOS, alphas=100, cv=inner_folds(teams))
+        model.fit(scaler.transform(x), y)
+    convergence = sum(issubclass(w.category, ConvergenceWarning) for w in caught)
+    return scaler, model, convergence, len(caught) - convergence
+
+
+def tier_inputs(d, tier, fold):
+    """A prefix of T4's columns, or for T5 all of them and the fold's embeddings."""
+    return np.hstack([d["x"], d["emb"][fold]]) if tier == "T5" else d["x"][:, : len(TIERS[tier])]
+
+
+def out_of_fold(d, teams, folds, branch, tier):
+    """Each outer fold's rows predicted by the tier fitted on the other folds' rows; and per fold
+    the rows, alpha, mix, nonzero coefficients and warnings."""
+    pred, fits = np.empty(len(folds)), []
+    for f in ORDER[branch]:
+        test = folds == f
+        x = tier_inputs(d, tier, f)
+        scaler, model, convergence, other = fit(x[~test], d["target"][~test], teams[~test])
+        pred[test] = model.predict(scaler.transform(x[test]))
+        fits.append(
+            {"fold": f, "train": int((~test).sum()), "held_out": int(test.sum())}
+            | {"alpha": model.alpha_, "mix": model.l1_ratio_}
+            | {"nonzero": int((model.coef_ != 0).sum()), "convergence": convergence}
+            | {"other": other}
+        )
+    return pred, fits
+
+
+def predictions(data, folds, branches=BRANCHES, tiers=TIERS):
+    """Out-of-fold predictions and fits per branch and tier with BLAS held to one thread, and the
+    BLAS thread counts seen while fitting."""
+    with threadpool_limits(limits=1, user_api="blas"):
+        blas = sorted({i["num_threads"] for i in threadpool_info() if i["user_api"] == "blas"})
+        out = {
+            (b, t): out_of_fold(data[b], data["team"], folds[b], b, t)
+            for b in branches
+            for t in tiers
+        }
+    return out, blas
+
+
+def warned(fits):
+    """ConvergenceWarnings and other warnings summed over fits' folds."""
+    per = [f for _, fs in fits.values() for f in fs]
+    return sum(f["convergence"] for f in per), sum(f["other"] for f in per)
+
+
+def sse(target, pred):
+    return float(((target - pred) ** 2).sum())
+
+
+def mask(league, subset):
+    return np.ones(len(league), bool) if subset == "outfield" else league == subset
+
+
+def records(league, target, psi2, preds):
+    """Per subset, all rows and each league's, and per model: SSE, psi2 sum and rows."""
+    out = []
+    for s in SUBSETS:
+        m = mask(league, s)
+        for name, p in preds.items():
+            out.append((s, name, sse(target[m], p[m]), float(psi2[m].sum()), int(m.sum())))
+    return out
+
+
+def ratios(t, index):
+    """From one row per model with sse and psi2_sum: TSE and the three ratios, one column per
+    model, and the six differences in SSE, one column per comparison."""
+    sse_ = t.pivot(index=index, columns="model", values="sse")
+    tse = sse_ - t.pivot(index=index, columns="model", values="psi2_sum")
+    return {
+        "tse": tse,
+        "tse_ratio_p2": tse.div(tse.P2, axis=0),
+        "sse_ratio_p2": sse_.div(sse_.P2, axis=0),
+        "tse_ratio_p3": tse.div(tse.P3, axis=0),
+        "sse_diff": pd.DataFrame({f"{a}-{b}": sse_[a] - sse_[b] for a, b in COMPARISONS}),
+    }
+
+
+def long(frame, name):
+    """A frame with one column per model or comparison, as rows."""
+    return frame.reset_index().melt(id_vars=frame.index.names, var_name="item", value_name=name)
+
+
+def scores(data, preds):
+    """2d: per branch, subset and model on all rows."""
+    rows = []
+    for b in BRANCHES:
+        d = data[b]
+        for s, name, e, psi2, n in records(data["league"], d["target"], d["psi2"], preds[b]):
+            m = mask(data["league"], s)
+            p, t = preds[b][name][m], d["target"][m]
+            rows.append(
+                {"branch": b, "subset": s, "model": name, "sse": e, "psi2_sum": psi2, "rows": n}
+                | {"spearman": sh.spearman(p, t), "slope": sh.ols_line(p, t)[0]}
+            )
+    t = pd.DataFrame(rows)
+    r = ratios(t, ["branch", "subset"])
+    table = t.rename(columns={"model": "item"})
+    for name in ["tse", "tse_ratio_p2", "sse_ratio_p2", "tse_ratio_p3"]:
+        table = table.merge(long(r[name], name), on=["branch", "subset", "item"])
+    cols = ["sse", "psi2_sum", "tse", "tse_ratio_p2", "sse_ratio_p2", "tse_ratio_p3"]
+    for b in BRANCHES:
+        key(f"\n2d {b}: all rows; Spearman and slope from shrinkage.spearman and ols_line")
+        part = table[table.branch == b].set_index(["subset", "item"])
+        key(show(part[[*cols, "spearman", "slope", "rows"]], 6))
+        key(f"2d {b}: differences in SSE")
+        key(show(r["sse_diff"].loc[b], 6))
+    for x in table.itertuples():
+        print(
+            f"2d {x.branch} {x.subset} {x.item}: sse {x.sse!r}, psi2 sum {x.psi2_sum!r}, "
+            f"rows {x.rows}, spearman {x.spearman!r}, slope {x.slope!r}"
+        )
+    for (b, s), x in r["sse_diff"].iterrows():
+        print(f"2d {b} {s} differences in SSE: " + ", ".join(f"{c} {v!r}" for c, v in x.items()))
+    head = table.set_index(["branch", "subset", "item"]).loc[("pooled", "outfield")]
+    got = [head.tse_ratio_p2["P0"], head.tse_ratio_p2["P3"], head.sse_ratio_p2["P3"]]
+    key(f"2d pooled outfield: TSE(P0)/TSE(P2), TSE(P3)/TSE(P2), SSE(P3)/SSE(P2) {got}")
+    assert [round(v, 3) for v in got] == [0.793, 0.469, 0.809], "HARD STOP: baselines differ"
+
+
+def describe(data):
+    """2g, description only: each tier fitted on all pooled rows, rescaled over all of them."""
+    d = data["pooled"]
+    with threadpool_limits(limits=1, user_api="blas"):
+        for t, cols in TIERS.items():
+            # every pooled group holds the pooled network's embeddings
+            _, model, convergence, other = fit(tier_inputs(d, t, 0), d["target"], data["team"])
+            coef = pd.Series(model.coef_, index=cols)
+            kept = coef[coef != 0].sort_values(key=np.abs, ascending=False)
+            key(
+                f"\n2g {t}: alpha {model.alpha_!r}, mix {model.l1_ratio_!r}, nonzero {len(kept)} "
+                f"of {len(cols)}, ConvergenceWarnings {convergence}, other warnings {other}"
+            )
+            key(show(kept.to_frame("coefficient"), 6))
+
+
+def fit_tiers():
+    frames, est, data, folds, _, code = setup()
+    counts = {t: len(c) for t, c in TIERS.items()}
+    key(f"2a: inputs per tier {counts}")
+    assert list(counts.values()) == [9, 10, 25, 32, 48], "HARD STOP: inputs per tier"
+    seeds = pd.read_parquet(seeds_path())
+    keys = frames["pooled"][KEYS]
+    emb = {s: fold_embeddings(seeds[seeds.seed == s], est, keys, s) for s in SEEDS}
+
+    fits, blas = predictions(data, folds)
+    key(f"\n2c: BLAS threads while fitting {blas}")
+    for (b, t), (_, per) in fits.items():
+        for f in per:
+            key(
+                f"2c {b} {t} fold {f['fold']}: training rows {f['train']}, held out "
+                f"{f['held_out']}, alpha {f['alpha']!r}, mix {f['mix']!r}, "
+                f"nonzero coefficients {f['nonzero']}"
+            )
+        key(f"2c {b} {t}: ConvergenceWarnings, other warnings {warned({(b, t): fits[(b, t)]})}")
+    key(f"2c: ConvergenceWarnings, other warnings, all tiers {warned(fits)}")
+    preds = {b: {t: fits[(b, t)][0] for t in TIERS} for b in BRANCHES}
+    scores(data, {b: preds[b] | {p: data[b][p] for p in BASELINES} for b in BRANCHES})
+
+    again, _ = predictions(data, folds, ["pooled"], ["T5"])
+    same = np.array_equal(again[("pooled", "T5")][0], preds["pooled"]["T5"])
+    key(f"\n2e: pooled T5 fitted again, predictions identical {same}, warnings {warned(again)}")
+    assert same, "HARD STOP: the pooled T5 predictions differ on a second fit"
+
+    seed_preds, diffs = {}, {}
+    for s in [0, *SEEDS]:
+        if s:
+            got, _ = predictions(fit_data(frames, emb[s], code), folds, tiers=["T5"])
+            seed_preds |= {(b, s): got[(b, "T5")][0] for b in BRANCHES}
+            key(f"2f seed {s}: ConvergenceWarnings, other warnings {warned(got)}")
+        for b in BRANCHES:
+            t5 = seed_preds[(b, s)] if s else preds[b]["T5"]
+            y = data[b]["target"]
+            diffs[(b, s)] = sse(y, t5) - sse(y, preds[b]["T4"])
+    key("\n2f: SSE(T5) less SSE(T4) over the outfield rows, by embedding seed")
+    key(show(pd.Series(diffs).unstack(), 6))
+    for (b, s), v in diffs.items():
+        key(f"2f {b} seed {s}: {v!r}")
+
+    describe(data)
+
+    out = [
+        keys.assign(branch=b, tier=t, seed=0, fold=folds[b].astype(str), prediction=preds[b][t])
+        for b in BRANCHES
+        for t in TIERS
+    ]
+    out += [
+        keys.assign(branch=b, tier="T5", seed=s, fold=folds[b].astype(str), prediction=p)
+        for (b, s), p in seed_preds.items()
+    ]
+    out = pd.concat(out, ignore_index=True)
+    out.to_parquet(predictions_path(), index=False)
+    key(f"\n2h: wrote {predictions_path()} with {len(out)} rows, columns {list(out.columns)}")
+
+
+def draws(teams):
+    """Every redraw from one generator seeded 0: each league's 20 teams drawn with replacement, in
+    LEAGUES order, then the distinct drawn teams dealt to the pooled groups."""
+    rng = np.random.default_rng(sh.SEED)
+    rows = []
+    for r in range(REDRAWS):
+        drawn = {}
+        for lg in LEAGUES:
+            ids = teams[lg]
+            drawn[lg] = np.unique(rng.choice(ids, size=len(ids)), return_counts=True)
+        group = deal({lg: ids for lg, (ids, _) in drawn.items()}, rng)
+        for lg, (ids, counts) in drawn.items():
+            rows += [
+                (r, lg, int(t), int(n), group[(lg, int(t))])
+                for t, n in zip(ids, counts, strict=True)
+            ]
+    return pd.DataFrame(rows, columns=["replicate", "league", "team_id", "count", "group"])
+
+
+def draw_arrays(frame, code):
+    """Per redraw, count and pooled group by team code, 0 and -1 for teams not drawn."""
+    out = []
+    for _, d in frame.groupby("replicate"):
+        c = [code[k] for k in zip(d.league, d.team_id, strict=True)]
+        count, group = np.zeros(len(code), "int64"), np.full(len(code), -1)
+        count[c], group[c] = d["count"].to_numpy(), d.group.to_numpy()
+        out.append((count, group))
+    return out
+
+
+def copies(team, count, group):
+    """A redraw's rows, each row once per draw of its team, as positions; and each row's pooled
+    group. count and group are indexed by team code."""
+    idx = np.repeat(np.arange(len(team)), count[team])
+    return idx, group[team[idx]]
+
+
+def redraw(data, count, group):
+    """One redraw: every tier refitted out of fold on the drawn rows of both branches, the copies
+    of a team keeping its code. Returns the records, ConvergenceWarnings, other warnings and the
+    BLAS thread counts seen."""
+    idx, pooled = copies(data["team"], count, group)
+    d = {"team": data["team"][idx], "league": data["league"][idx]}
+    for b in BRANCHES:
+        d[b] = {c: v[idx] for c, v in data[b].items() if c != "emb"}
+        d[b]["emb"] = {f: e[idx] for f, e in data[b]["emb"].items()}
+    fits, blas = predictions(d, {"pooled": pooled, "lolo": d["league"]})
+    out = []
+    for b in BRANCHES:
+        preds = {t: fits[(b, t)][0] for t in TIERS} | {p: d[b][p] for p in BASELINES}
+        out += [(b, *r) for r in records(d["league"], d[b]["target"], d[b]["psi2"], preds)]
+    return out, *warned(fits), blas
+
+
+def run_redraws(data, arrays, replicates, workers):
+    jobs = (delayed(redraw)(data, *arrays[r]) for r in replicates)
+    return Parallel(n_jobs=workers, backend="loky")(jobs)
+
+
+def bootstrap():
+    _, _, data, _, teams, code = setup()
+    d = draws(teams)
+    d.to_parquet(draws_path(), index=False)
+    per = d.groupby(["replicate", "league"])["count"].sum()
+    distinct = d.groupby("replicate").size()
+    key(
+        f"\n3a: wrote {draws_path()} with {len(d)} rows over {d.replicate.nunique()} redraws; "
+        f"distinct teams per redraw min {distinct.min()}, max {distinct.max()}"
+    )
+    assert (per == 20).all(), "a league's draw does not hold 20 teams"
+    arrays = draw_arrays(d, code)
+
+    start = time.perf_counter()
+    eight = run_redraws(data, arrays, range(CHECK_REDRAWS), WORKERS)
+    per_redraw = (time.perf_counter() - start) / CHECK_REDRAWS
+    key(
+        f"\n3c: redraws 0 to {CHECK_REDRAWS - 1} with 8 workers: seconds per redraw "
+        f"{per_redraw:.2f}, projected for {REDRAWS} {per_redraw * REDRAWS / 3600:.2f} h; "
+        f"ConvergenceWarnings {sum(g[1] for g in eight)}, other warnings "
+        f"{sum(g[2] for g in eight)}, BLAS threads {sorted({t for g in eight for t in g[3]})}"
+    )
+    assert per_redraw * REDRAWS <= LIMIT_S, "HARD STOP: the projection exceeds 6 hours"
+    start = time.perf_counter()
+    one = run_redraws(data, arrays, range(CHECK_REDRAWS), 1)
+    same = [g[0] for g in one] == [g[0] for g in eight]
+    key(
+        f"3c: the same redraws with 1 worker: {time.perf_counter() - start:.1f} s, BLAS threads "
+        f"{sorted({t for g in one for t in g[3]})}; every record identical {same}"
+    )
+    assert same, "HARD STOP: the records differ between 1 and 8 workers"
+
+    part_path(0).parent.mkdir(parents=True, exist_ok=True)
+    for k in range(REDRAWS // PART):
+        path = part_path(k)
+        if path.exists():
+            key(f"3d part {k}: exists, skipped")
+            continue
+        start = time.perf_counter()
+        reps = range(k * PART, (k + 1) * PART)
+        got = run_redraws(data, arrays, reps, WORKERS)
+        rows = [(r, *rec) for r, g in zip(reps, got, strict=True) for rec in g[0]]
+        tmp = path.with_suffix(".tmp")
+        pd.DataFrame(rows, columns=RECORD).to_parquet(tmp, index=False)
+        tmp.replace(path)
+        key(
+            f"3d part {k}: redraws {reps.start} to {reps.stop - 1}, ConvergenceWarnings "
+            f"{sum(g[1] for g in got)}, other warnings {sum(g[2] for g in got)}, BLAS threads "
+            f"{sorted({t for g in got for t in g[3]})}, {time.perf_counter() - start:.1f} s"
+        )
+
+    out = pd.concat([pd.read_parquet(part_path(k)) for k in range(REDRAWS // PART)])
+    out = out.reset_index(drop=True)
+    out.to_parquet(bootstrap_path(), index=False)
+    key(f"\n3d: wrote {bootstrap_path()} with {len(out)} rows, columns {list(out.columns)}")
+    key(f"3d: records per redraw {out.groupby('replicate').size().unique().tolist()}")
+    assert len(out) == 160000, "HARD STOP: the bootstrap table does not have 160,000 rows"
+
+
+def passes(diff):
+    """The rule of the entry "Ablation success rule": the difference in SSE below zero in at least
+    1,950 of the 2,000 redraws, an equal SSE counting against."""
+    return int((np.asarray(diff) < 0).sum()) >= PASS_AT
+
+
+def saved_prediction(saved, frame, branch, tier, seed):
+    s = saved[(saved.branch == branch) & (saved.tier == tier) & (saved.seed == seed)]
+    return frame[KEYS].merge(s, on=KEYS, how="left", validate="one_to_one").prediction.to_numpy()
+
+
+def all_rows(frames):
+    """From the stored predictions, per branch, subset and model on all rows: SSE, psi2 sum and
+    rows; and per branch and seed, SSE(T5) less SSE(T4) over the outfield rows."""
+    saved = pd.read_parquet(predictions_path())
+    recs, diffs = [], {}
+    for b in BRANCHES:
+        f = frames[b]
+        y = f.target.to_numpy()
+        preds = {t: saved_prediction(saved, f, b, t, 0) for t in TIERS}
+        preds |= {p: f[p].to_numpy() for p in BASELINES}
+        recs += [(b, *r) for r in records(f.league.to_numpy(), y, f.psi2.to_numpy(), preds)]
+        for s in [0, *SEEDS]:
+            t5 = saved_prediction(saved, f, b, "T5", s)
+            diffs[(b, s)] = sse(y, t5) - sse(y, preds["T4"])
+    return pd.DataFrame(recs, columns=RECORD[1:]), diffs
+
+
+def intervals(frame, name):
+    """Per branch, subset and column of frame, indexed by branch, subset and replicate: the 2.5
+    and 97.5 percentiles and median over the redraws, as shrinkage.intervals computes them."""
+    rows = long(frame, "value").rename(columns={"item": "predictor"}).assign(metric=name)
+    out = [sh.intervals(rows[rows.branch == b]).reset_index().assign(branch=b) for b in BRANCHES]
+    return pd.concat(out).rename(columns={"predictor": "item"})
+
+
+def verdicts():
+    frames = pairs()
+    point, seed_diffs = all_rows(frames)
+    boot = pd.read_parquet(bootstrap_path())
+    key(f"4: redraws {boot.replicate.nunique()}, records {len(boot)}")
+    key(
+        "4: the intervals are conditional on the action-value models, calibrators, shrinkage "
+        "fits, league levels, style profiles, input centres and embeddings, held fixed"
+    )
+    at, over = ratios(point, ["branch", "subset"]), ratios(boot, ["branch", "subset", "replicate"])
+    index = ["branch", "subset", "item"]
+    parts = []
+    for name in ["sse_diff", "tse_ratio_p2", "sse_ratio_p2", "tse_ratio_p3"]:
+        q = intervals(over[name], name).merge(long(at[name], "all_rows"), on=index)
+        parts.append(q)
+    summary = pd.concat(parts, ignore_index=True)
+    diffs = long(over["sse_diff"], "value")
+    below = diffs.assign(below=diffs.value < 0).groupby(index).below.sum().reset_index()
+    ok = diffs.groupby(index).value.apply(passes).rename("passes").reset_index()
+    summary = summary.merge(below, on=index, how="left")
+    models = ["T1", "T2", "T3", "T4", "T5", "P3", "P0"]
+    keep = (summary.metric == "sse_diff") | summary.item.isin(models)
+    summary = summary[keep][[*index, "metric", "all_rows", "below", "p2_5", "p97_5", "median"]]
+    summary = summary.reset_index(drop=True).astype({"below": "Int64"})
+    summary.to_parquet(summary_path(), index=False)
+
+    order = [f"{a}-{b}" for a, b in COMPARISONS]
+    d = summary[summary.metric == "sse_diff"].merge(ok, on=index)
+    d = d.set_index(["branch", "subset", "item"])[["all_rows", "below", "passes", "p2_5", "p97_5"]]
+    for b in BRANCHES:
+        key(f"\n4a {b}, outfield: differences in SSE, redraws below zero, verdict (pass at 1,950)")
+        key(show(d.loc[(b, "outfield")].reindex(order), 4))
+    for b in BRANCHES:
+        for lg in LEAGUES:
+            key(f"\n4a {b}, {lg}: rests on that league's twenty teams alone; no verdict")
+            key(show(d.loc[(b, lg)].reindex(order).drop(columns="passes"), 4))
+    for x in d.itertuples():
+        print(
+            f"4a {' '.join(map(str, x.Index))}: below {x.below}, p2_5 {x.p2_5!r}, "
+            f"p97_5 {x.p97_5!r}, all rows {x.all_rows!r}"
+        )
+
+    r = summary[summary.metric != "sse_diff"].set_index([*index, "metric"])
+    r = r[["all_rows", "p2_5", "p97_5"]].unstack("metric")
+    for b in BRANCHES:
+        for s in SUBSETS:
+            flag = "" if s == "outfield" else "; rests on that league's twenty teams alone"
+            key(f"\n4b {b}, {s}: ratios on all rows and 95% intervals{flag}")
+            key(show(r.loc[(b, s)].reindex(models), 3))
+    for x in summary[summary.metric != "sse_diff"].itertuples():
+        print(
+            f"4b {x.branch} {x.subset} {x.item} {x.metric}: all rows {x.all_rows!r}, "
+            f"p2_5 {x.p2_5!r}, p97_5 {x.p97_5!r}"
+        )
+
+    verdict = {(b, c): bool(d.loc[(b, "outfield", c), "passes"]) for b in BRANCHES for c in order}
+    steps = order[:5]
+    failing = [c for c in steps if not verdict[("pooled", c)]]
+    key(
+        f"\n4c: every step from T1 to T5 passes on the pooled branch {not failing}; not passing "
+        f"{failing}"
+    )
+    only = [c for c in order if verdict[("pooled", c)] and not verdict[("lolo", c)]]
+    key(f"4c: passing on the pooled branch but not on the leave-one-league-out branch {only}")
+    later = [seed_diffs[("pooled", s)] for s in SEEDS]
+    if not verdict[("pooled", "T5-T4")]:
+        label = "T5 against T4 does not pass, so no seed label applies"
+    elif any(v >= 0 for v in later):
+        label = "the pass of T5 against T4 is seed-dependent"
+    else:
+        label = "the pass of T5 against T4 holds for seeds 1 to 4"
+    key(f"4c: seed label: {label}")
+    key("\n4c: SSE(T5) less SSE(T4) over the outfield rows on all rows, by embedding seed")
+    key(show(pd.Series(seed_diffs).unstack(), 6))
+    key(f"\n4c: wrote {summary_path()} with {len(summary)} rows, columns {list(summary.columns)}")
+
+
 def main(argv):
     step = argv[0]
     style.LOGS.mkdir(parents=True, exist_ok=True)
@@ -338,6 +929,12 @@ def main(argv):
             inputs()
         elif step == "participation":
             participation()
+        elif step == "fit":
+            fit_tiers()
+        elif step == "bootstrap":
+            bootstrap()
+        elif step == "verdicts":
+            verdicts()
     finally:
         sys.stdout = sys.__stdout__
         full.close()

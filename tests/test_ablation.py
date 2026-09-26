@@ -20,12 +20,135 @@ CELLS = {
     ("serie_a", "CB"): 66, ("serie_a", "FB"): 67, ("serie_a", "FWD"): 49,
     ("serie_a", "MID"): 88, ("serie_a", "WIDE"): 56,
 }  # fmt: skip
+# SSE over the 1,067 outfield pairs of the out-of-fold predictions, per branch and tier
+ALL_ROWS_SSE = {
+    ("pooled", "T1"): 22.318767443729293,
+    ("pooled", "T2"): 21.401271464610907,
+    ("pooled", "T3"): 20.823640172024373,
+    ("pooled", "T4"): 20.79994710607643,
+    ("pooled", "T5"): 20.911792783287282,
+    ("lolo", "T1"): 22.262971973636237,
+    ("lolo", "T2"): 21.211370908701618,
+    ("lolo", "T3"): 20.869155955457956,
+    ("lolo", "T4"): 20.635384644614884,
+    ("lolo", "T5"): 20.62709202275976,
+}
+# redraw 0 of the 2,000: rows per subset, psi2 sum per branch and subset, SSE per model
+REDRAW_ZERO_ROWS = {
+    "outfield": 1085,
+    "la_liga": 300,
+    "premier_league": 246,
+    "serie_a": 269,
+    "ligue_1": 270,
+}
+REDRAW_ZERO_PSI2 = {
+    ("pooled", "outfield"): 17.650244842594322,
+    ("pooled", "la_liga"): 5.381317002162959,
+    ("pooled", "premier_league"): 3.758539066113658,
+    ("pooled", "serie_a"): 4.402887662397664,
+    ("pooled", "ligue_1"): 4.10750111192004,
+    ("lolo", "outfield"): 17.620179330248014,
+    ("lolo", "la_liga"): 5.373386552148009,
+    ("lolo", "premier_league"): 3.7519972892658213,
+    ("lolo", "serie_a"): 4.39444075421399,
+    ("lolo", "ligue_1"): 4.100354734620196,
+}
+REDRAW_ZERO_SSE = {
+    ("pooled", "outfield", "T1"): 24.22714510211608,
+    ("pooled", "outfield", "T2"): 23.305002363454765,
+    ("pooled", "outfield", "T3"): 22.148749942890298,
+    ("pooled", "outfield", "T4"): 21.975098374456287,
+    ("pooled", "outfield", "T5"): 21.996762887009822,
+    ("pooled", "outfield", "P0"): 28.161504895042988,
+    ("pooled", "outfield", "P2"): 28.70710313562629,
+    ("pooled", "outfield", "P3"): 24.10746501919703,
+    ("pooled", "la_liga", "T1"): 7.213109634939958,
+    ("pooled", "la_liga", "T2"): 6.74379278003434,
+    ("pooled", "la_liga", "T3"): 6.4756273816710035,
+    ("pooled", "la_liga", "T4"): 6.244333386639115,
+    ("pooled", "la_liga", "T5"): 6.182363763905629,
+    ("pooled", "la_liga", "P0"): 9.501281138273601,
+    ("pooled", "la_liga", "P2"): 7.6434489368613665,
+    ("pooled", "la_liga", "P3"): 6.7461094480167825,
+    ("pooled", "premier_league", "T1"): 4.790391253235569,
+    ("pooled", "premier_league", "T2"): 4.49731940520474,
+    ("pooled", "premier_league", "T3"): 4.59415880494785,
+    ("pooled", "premier_league", "T4"): 4.661547785275497,
+    ("pooled", "premier_league", "T5"): 4.692263920117849,
+    ("pooled", "premier_league", "P0"): 5.378285803498022,
+    ("pooled", "premier_league", "P2"): 6.15139464291711,
+    ("pooled", "premier_league", "P3"): 4.374371508230386,
+    ("pooled", "serie_a", "T1"): 4.916973778967902,
+    ("pooled", "serie_a", "T2"): 4.835078594012251,
+    ("pooled", "serie_a", "T3"): 4.3535216682146896,
+    ("pooled", "serie_a", "T4"): 4.472953199665331,
+    ("pooled", "serie_a", "T5"): 4.433491351098269,
+    ("pooled", "serie_a", "P0"): 5.329000170684864,
+    ("pooled", "serie_a", "P2"): 7.217314800530536,
+    ("pooled", "serie_a", "P3"): 5.204400465475957,
+    ("pooled", "ligue_1", "T1"): 7.306670434972652,
+    ("pooled", "ligue_1", "T2"): 7.228811584203433,
+    ("pooled", "ligue_1", "T3"): 6.725442088056758,
+    ("pooled", "ligue_1", "T4"): 6.596264002876347,
+    ("pooled", "ligue_1", "T5"): 6.688643851888074,
+    ("pooled", "ligue_1", "P0"): 7.952937782586499,
+    ("pooled", "ligue_1", "P2"): 7.694944755317281,
+    ("pooled", "ligue_1", "P3"): 7.782583597473906,
+    ("lolo", "outfield", "T1"): 24.08234673576788,
+    ("lolo", "outfield", "T2"): 23.308324089077843,
+    ("lolo", "outfield", "T3"): 22.85583795855356,
+    ("lolo", "outfield", "T4"): 22.72974127884851,
+    ("lolo", "outfield", "T5"): 24.18848781178579,
+    ("lolo", "outfield", "P0"): 28.658109880553454,
+    ("lolo", "outfield", "P2"): 29.26152251801578,
+    ("lolo", "outfield", "P3"): 24.532951173529078,
+    ("lolo", "la_liga", "T1"): 6.540198770382895,
+    ("lolo", "la_liga", "T2"): 6.36177721908915,
+    ("lolo", "la_liga", "T3"): 6.112807041839503,
+    ("lolo", "la_liga", "T4"): 6.06240825929787,
+    ("lolo", "la_liga", "T5"): 7.255727173859549,
+    ("lolo", "la_liga", "P0"): 9.586483053194861,
+    ("lolo", "la_liga", "P2"): 7.909368795112316,
+    ("lolo", "la_liga", "P3"): 6.861089247613337,
+    ("lolo", "premier_league", "T1"): 4.9263995277289805,
+    ("lolo", "premier_league", "T2"): 4.62408766207527,
+    ("lolo", "premier_league", "T3"): 4.64521000958543,
+    ("lolo", "premier_league", "T4"): 4.663163166561166,
+    ("lolo", "premier_league", "T5"): 4.681669123756128,
+    ("lolo", "premier_league", "P0"): 5.421996690565026,
+    ("lolo", "premier_league", "P2"): 6.174421071902821,
+    ("lolo", "premier_league", "P3"): 4.409318283036347,
+    ("lolo", "serie_a", "T1"): 5.4061214018728085,
+    ("lolo", "serie_a", "T2"): 5.131754260577374,
+    ("lolo", "serie_a", "T3"): 5.043627001294626,
+    ("lolo", "serie_a", "T4"): 4.9937877738798,
+    ("lolo", "serie_a", "T5"): 5.238535692285398,
+    ("lolo", "serie_a", "P0"): 5.733427766814282,
+    ("lolo", "serie_a", "P2"): 7.425807672129579,
+    ("lolo", "serie_a", "P3"): 5.501961214496737,
+    ("lolo", "ligue_1", "T1"): 7.209627035783195,
+    ("lolo", "ligue_1", "T2"): 7.1907049473360445,
+    ("lolo", "ligue_1", "T3"): 7.054193905834003,
+    ("lolo", "ligue_1", "T4"): 7.010382079109675,
+    ("lolo", "ligue_1", "T5"): 7.012555821884715,
+    ("lolo", "ligue_1", "P0"): 7.916202369979286,
+    ("lolo", "ligue_1", "P2"): 7.751924978871065,
+    ("lolo", "ligue_1", "P3"): 7.760582428382657,
+}
 
 
 def need(path):
     if not path.exists():
         pytest.skip(f"local data cache missing: {path}")
     return path
+
+
+def fit_setup():
+    for branch in sh.BRANCHES:
+        need(sh.evaluation_path(branch))
+    need(ablation.inputs_path())
+    need(graph.embeddings_path())
+    return ablation.setup()
 
 
 @pytest.mark.slow
@@ -60,6 +183,29 @@ def test_seed_zero_rebuilds_the_stored_embeddings():
     need(graph.links_path())
     stored = pd.read_parquet(need(graph.embeddings_path()))
     assert graph.embedding_table(graph.SCORED).equals(stored)
+
+
+@pytest.mark.slow
+def test_all_rows_sse_of_every_tier():
+    _, _, data, folds, _, _ = fit_setup()
+    fits, blas = ablation.predictions(data, folds)
+    assert blas == [1]
+    got = {(b, t): ablation.sse(data[b]["target"], p) for (b, t), (p, _) in fits.items()}
+    assert got == ALL_ROWS_SSE
+
+
+@pytest.mark.slow
+def test_redraw_zero_records():
+    _, _, data, _, teams, code = fit_setup()
+    draws = ablation.draws(teams)
+    count, group = ablation.draw_arrays(draws[draws.replicate == 0], code)[0]
+    records, _, _, blas = ablation.redraw(data, count, group)
+    assert blas == [1]
+    expected = {
+        (b, s, m): (e, REDRAW_ZERO_PSI2[(b, s)], REDRAW_ZERO_ROWS[s])
+        for (b, s, m), e in REDRAW_ZERO_SSE.items()
+    }
+    assert {(b, s, m): (e, p, n) for b, s, m, e, p, n in records} == expected
 
 
 def actions(rows):
@@ -172,3 +318,34 @@ def test_centring_and_fit_products():
     # centred products 2, 2 and 4, 0, 8; from uncentred scores they would be 2, 18 and 0, 4, 32
     for col in ablation.FIT:
         assert fit[col].tolist() == [0.0, 0.0, 0.0, -4.0, 4.0]
+
+
+def test_the_deal_gives_four_teams_per_league_per_group_and_copies_share_one():
+    teams = {lg: np.arange(20) + 100 * i for i, lg in enumerate(ablation.LEAGUES)}
+    group = ablation.deal(teams, np.random.default_rng(0))
+    per = pd.Series(group).groupby(level=0).value_counts()
+    assert per.to_dict() == {(lg, g): 4 for lg in ablation.LEAGUES for g in range(5)}
+    # rows of three teams: the first drawn three times, the second not at all, the third twice
+    idx, rows = ablation.copies(
+        np.array([0, 0, 1, 2, 2, 2]), np.array([3, 0, 2]), np.array([4, -1, 1])
+    )
+    assert idx.tolist() == [0, 0, 0, 1, 1, 1, 3, 3, 4, 4, 5, 5]
+    assert rows.tolist() == [4] * 6 + [1] * 6
+
+
+def test_inner_folds_keep_a_teams_copies_together():
+    team = np.repeat(np.arange(12), [1, 2, 3] * 4)
+    count = np.array([2, 1, 0, 3, 1, 1, 2, 1, 1, 2, 1, 1])
+    idx, _ = ablation.copies(team, count, np.zeros(12, "int64"))
+    rows = team[idx]
+    folds = ablation.inner_folds(rows)
+    assert len(folds) == 5
+    assert np.sort(np.concatenate([test for _, test in folds])).tolist() == list(range(len(rows)))
+    for train, test in folds:
+        assert not set(rows[train]) & set(rows[test])
+
+
+def test_the_pass_rule_needs_1950_redraws_below_zero_and_counts_a_tie_against():
+    assert ablation.passes(np.r_[-np.ones(1950), np.ones(50)])
+    assert not ablation.passes(np.r_[-np.ones(1949), np.ones(51)])
+    assert not ablation.passes(np.r_[-np.ones(1949), np.zeros(51)])

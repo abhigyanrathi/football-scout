@@ -13,6 +13,7 @@ class Tee:
         self.full.write(text)
         if self.echo:
             self.brief.write(text)
+        self.flush()
 
     def flush(self):
         self.full.flush()
