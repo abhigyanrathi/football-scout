@@ -25,6 +25,17 @@ ROW_REASONS = {
 CUTOFF = pd.Timestamp("2016-02-02")
 BUDGETS = {0.25: 15_000_000, 0.5: 35_000_000, 0.75: 90_000_000}
 CHEAPEST = 2_050_000
+# from p7_full_summary.log
+HEADLINE_SQUADS = {
+    "P3": [3248, 3404, 3625, 3814, 5656, 6732, 7475, 23349, 40367, 40427],
+    "P2": [3404, 3990, 4597, 5554, 5656, 6847, 19299, 23349, 40247, 40427],
+}
+HEADLINE_ACTUAL = {"P3": 1.3033749390409892, "P2": 0.4944632023913539}
+RECOMMENDED = [3204, 3404, 3625, 3814, 5656, 6732, 7475, 23349, 40367, 40427]
+RANDOM_BELOW = {15_000_000: 9305, 35_000_000: 9988, 90_000_000: 9834}
+# from p7_tally_summary.log
+WINS = {15_000_000: 1154, 35_000_000: 1339, 90_000_000: 1085}
+IDENTICAL = {15_000_000: 1, 35_000_000: 0, 90_000_000: 0}
 
 
 def need(path):
@@ -135,3 +146,50 @@ def test_pool_has_no_window_two_column_and_the_pairs_values():
     m = ev.merge(pool, on=sh.KEYS, how="left", suffixes=("", "_pool"), validate="one_to_one")
     assert len(m) == 1067 and m.pair.eq(True).all() and pool.pair.sum() == 1067
     assert (m.P2 == m.P2_pool).all() and (m.P3 == m.P3_pool).all()
+
+
+def full_inputs():
+    pool = pd.read_parquet(need(squad.pool_path()))
+    need(sh.evaluation_path("pooled"))
+    return squad.with_target(squad.priced_pairs(pool)), squad.priced_rows(pool)
+
+
+@pytest.mark.slow
+def test_full_pool_squads_are_the_stored_ones():
+    stored = pd.read_parquet(need(squad.full_path()))
+    pairs, rows = full_inputs()
+    got = squad.squad_table(pairs, rows, squad.full_squads(pairs, rows))
+    pd.testing.assert_frame_equal(got, stored, check_exact=True)
+    headline = got[got.budget == squad.BUDGETS[squad.HEADLINE]]
+    for kind, ids in HEADLINE_SQUADS.items():
+        players = headline[headline.kind == kind]
+        assert sorted(players.player_id) == ids
+        assert abs(players.target.to_numpy().sum() - HEADLINE_ACTUAL[kind]) <= 1e-12
+    assert sorted(headline[headline.kind == "recommended"].player_id) == RECOMMENDED
+
+
+@pytest.mark.slow
+def test_random_squads_below_the_p3_squad_and_the_first_twenty_rebuilt():
+    stored = pd.read_parquet(need(squad.random_path()))
+    full = pd.read_parquet(need(squad.full_path()))
+    assert len(stored) == 30_000
+    for b, below in RANDOM_BELOW.items():
+        p3 = full[(full.kind == "P3") & (full.budget == b)].target.to_numpy().sum()
+        assert (stored[stored.budget == b].actual < p3).sum() == below
+    pairs, _ = full_inputs()
+    b = squad.BUDGETS[squad.HEADLINE]
+    first = stored[(stored.budget == b) & (stored.draw < 20)].reset_index(drop=True)
+    pd.testing.assert_frame_equal(squad.random_squads(pairs, b, 20), first, check_exact=True)
+
+
+@pytest.mark.slow
+def test_redraw_counts_and_redraws_zero_to_two_solved_again():
+    stored = pd.read_parquet(need(squad.redraws_path()))
+    assert len(stored) == 12_000
+    counts = squad.outcomes(stored)
+    assert counts.wins.to_dict() == WINS and counts.identical.to_dict() == IDENTICAL
+    pairs, _ = full_inputs()
+    draws = pd.read_parquet(need(squad.draws_path()), columns=["replicate", "league", "team_id"])
+    got = squad.redraw_table(range(3), pairs, draws)
+    want = stored[stored.replicate < 3].reset_index(drop=True)
+    pd.testing.assert_frame_equal(got, want, check_exact=True)

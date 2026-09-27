@@ -1,5 +1,6 @@
 import math
 import sys
+import time
 
 import numpy as np
 import pandas as pd
@@ -9,7 +10,7 @@ from fbrecruit import shrinkage as sh
 from fbrecruit import split
 from fbrecruit.links import data
 from fbrecruit.logs import Tee, key
-from fbrecruit.paths import PROCESSED
+from fbrecruit.paths import INTERIM, PROCESSED
 from fbrecruit.sources.statsbomb import LEAGUES, OUT
 
 BRANCH = "pooled"
@@ -26,6 +27,21 @@ VALUATION_DAYS = 365
 REASONS = ["no Transfermarkt id", "shared Transfermarkt id", "no valuation", "priced"]
 QUOTAS = {"CB": 2, "FB": 2, "MID": 3, "WIDE": 2, "FWD": 1}
 QUANTILES = [0.25, 0.5, 0.75]
+PRICED_PAIRS = 1054
+PRICED_ROWS = 1280
+# from p7_budgets_summary.log
+BUDGETS = {0.25: 15_000_000, 0.5: 35_000_000, 0.75: 90_000_000}
+HEADLINE = 0.5
+PREDICTORS = ["P3", "P2"]
+# the value each kind of squad is picked or ordered by
+VALUE = {"P3": "P3", "P2": "P2", "greedy": "P3", "recommended": "P3"}
+COLUMNS = [*KEYS, "player_name", "team_name", "group", "price", "P2", "P3", "target"]
+RANDOM_SQUADS = 10_000
+PART = 200
+CHECK_REDRAWS = 16
+LIMIT_S = 7200
+PASS = 1950
+RECORD = ["replicate", "budget", "predictor", "squad", "predicted", "actual", "cost", "n_pool"]
 
 
 def draws_path():
@@ -39,6 +55,22 @@ def links_path():
 
 def pool_path():
     return PROCESSED / "squad_pool.parquet"
+
+
+def full_path():
+    return PROCESSED / "squad_full.parquet"
+
+
+def random_path():
+    return PROCESSED / "squad_random.parquet"
+
+
+def redraws_path():
+    return PROCESSED / "squad_redraws.parquet"
+
+
+def part_path(k):
+    return INTERIM / "squad_redraws" / f"part_{k}.parquet"
 
 
 def evaluation():
@@ -334,19 +366,258 @@ def fill(order, prices, groups, players, budget, quotas=QUOTAS):
     raise ValueError("the order ended before every place was filled")
 
 
+def with_target(pairs):
+    """The pairs, in their order, with their target; only the keys and the target are read from the
+    evaluation table."""
+    target = pd.read_parquet(sh.evaluation_path(BRANCH), columns=[*KEYS, "target"])
+    return pairs.merge(target, on=KEYS, how="left", validate="one_to_one")
+
+
+def priced_rows(pool):
+    p = pool[pool.reason == "priced"]
+    return p.assign(price=p.price.astype("int64"))
+
+
+def totals(players, pos, value):
+    """A squad's predicted value, actual value and cost, summed over its positions in ascending
+    order."""
+    return tuple(players[c].to_numpy()[pos].sum() for c in (value, "target", "price"))
+
+
+def full_squads(pairs, rows):
+    """Positions of the P3, P2 and greedy squads in pairs at each budget and of the recommended
+    squad in rows at the headline budget, by kind and budget."""
+    args = pairs.price, pairs.group, pairs.player_id
+    order = np.argsort(-pairs.P3.to_numpy(), kind="stable")
+    chosen = {}
+    for b in BUDGETS.values():
+        for p in PREDICTORS:
+            chosen[p, b] = pick(pairs[p], *args, b)
+        chosen["greedy", b] = fill(order, *args, b)
+    b = BUDGETS[HEADLINE]
+    chosen["recommended", b] = pick(rows.P3, rows.price, rows.group, rows.player_id, b)
+    return chosen
+
+
+def squad_table(pairs, rows, chosen):
+    """One row per player of each squad; the recommended squad's rows have no target."""
+    frames = []
+    for (kind, b), pos in chosen.items():
+        players = rows.assign(target=np.nan) if kind == "recommended" else pairs
+        frames.append(players.iloc[pos].assign(kind=kind, budget=b))
+    return pd.concat(frames, ignore_index=True)[["kind", "budget", *COLUMNS]]
+
+
+def random_squads(pairs, budget, n=RANDOM_SQUADS):
+    """n squads filled in orders from a new generator seeded 0, with their actual value and cost."""
+    price, group, player = (pairs[c].to_numpy() for c in ("price", "group", "player_id"))
+    target = pairs.target.to_numpy()
+    rng = np.random.default_rng(0)
+    rows = []
+    for d in range(n):
+        pos = fill(rng.permutation(len(pairs)), price, group, player, budget)
+        rows.append((budget, d, target[pos].sum(), price[pos].sum()))
+    return pd.DataFrame(rows, columns=["budget", "draw", "actual", "cost"])
+
+
+def listing(players, value):
+    """A squad in the group order of QUOTAS, by value from highest within a group."""
+    rank = players.group.map({g: i for i, g in enumerate(QUOTAS)})
+    t = players.assign(rank=rank).sort_values(["rank", value], ascending=[True, False])
+    cols = ["group", "player_id", "player_name", "team_name", "league", "price", "P3", "P2"]
+    if "target" in t:
+        cols.append("target")
+    return t[cols].to_string(index=False, float_format=repr)
+
+
+def full_pool():
+    start = time.perf_counter()
+    pool = pd.read_parquet(pool_path())
+    pairs, rows = with_target(priced_pairs(pool)), priced_rows(pool)
+    missing = int(pairs.target.isna().sum())
+    key(
+        f"3: priced pairs {len(pairs)}, with no target {missing}, player_id unique "
+        f"{pairs.player_id.is_unique}; priced rows {len(rows)}"
+    )
+    counts = (len(pairs), missing, len(rows))
+    assert counts == (PRICED_PAIRS, 0, PRICED_ROWS), "HARD STOP: the priced pairs or rows differ"
+    levels = budgets(pairs.price)
+    key(f"3: budgets {levels}")
+    assert levels == BUDGETS, "HARD STOP: the budgets differ from p7_budgets_summary.log"
+
+    chosen = full_squads(pairs, rows)
+    headline = BUDGETS[HEADLINE]
+    args = pairs.price, pairs.group, pairs.player_id
+    again = {p: pick(pairs[p], *args, headline) for p in PREDICTORS}
+    repeat = {p: np.array_equal(again[p], chosen[p, headline]) for p in PREDICTORS}
+    random = pd.concat([random_squads(pairs, b) for b in BUDGETS.values()], ignore_index=True)
+
+    for q, b in BUDGETS.items():
+        key(f"\n3: budget {b} (quantile {q})")
+        actual = {}
+        for kind in ["P3", "P2", "greedy"]:
+            pos = chosen[kind, b]
+            predicted, actual[kind], cost = totals(pairs, pos, VALUE[kind])
+            key(f"\n3: {kind} squad")
+            key(listing(pairs.iloc[pos], VALUE[kind]))
+            key(f"3: {kind} predicted {predicted!r}, actual {actual[kind]!r}, cost {cost!r}")
+        p3, p2 = (set(pairs.player_id.iloc[chosen[p, b]]) for p in PREDICTORS)
+        key(f"\n3: players the P3 and P2 squads share {len(p3 & p2)}")
+        if b == headline:
+            key(f"3: picked again, the same positions {repeat}")
+        below = int((random.actual[random.budget == b] < actual["P3"]).sum())
+        key(f"3: random squads below the P3 squad's actual value {below} of {RANDOM_SQUADS}")
+
+    pos = chosen["recommended", headline]
+    predicted, cost = rows.P3.to_numpy()[pos].sum(), rows.price.to_numpy()[pos].sum()
+    key(f"\n3: recommended squad, budget {headline}, from the {len(rows)} priced rows")
+    key(listing(rows.iloc[pos], "P3"))
+    key(f"3: recommended predicted {predicted!r}, cost {cost!r}")
+
+    assert all(repeat.values()), "HARD STOP: a squad picked again has other positions"
+    table = squad_table(pairs, rows, chosen)
+    table.to_parquet(full_path(), index=False)
+    random.to_parquet(random_path(), index=False)
+    key(f"\n3: wrote {full_path()} with {len(table)} rows, columns {list(table.columns)}")
+    key(f"3: wrote {random_path()} with {len(random)} rows, columns {list(random.columns)}")
+    key(f"3: {time.perf_counter() - start:.1f} s")
+
+
+def redraw_inputs():
+    pairs = with_target(priced_pairs(pd.read_parquet(pool_path())))
+    draws = pd.read_parquet(draws_path(), columns=["replicate", "league", "team_id"])
+    return pairs, draws
+
+
+def redraw(r, pairs, draws):
+    """Records of the P3 and P2 squads at each budget, picked from the pairs of the teams redraw r
+    drew, in the pairs' order and each once."""
+    teams = pd.MultiIndex.from_frame(draws.loc[draws.replicate == r, ["league", "team_id"]])
+    drawn = pairs[pd.MultiIndex.from_frame(pairs[["league", "team_id"]]).isin(teams)]
+    price, group, player = (drawn[c].to_numpy() for c in ("price", "group", "player_id"))
+    out = []
+    for b in BUDGETS.values():
+        for p in PREDICTORS:
+            pos = pick(drawn[p], price, group, player, b)
+            squad = " ".join(map(str, np.sort(player[pos])))
+            out.append((r, b, p, squad, *totals(drawn, pos, p), len(drawn)))
+    return out
+
+
+def redraw_table(replicates, pairs, draws):
+    return pd.DataFrame([x for r in replicates for x in redraw(r, pairs, draws)], columns=RECORD)
+
+
+def timing():
+    pairs, draws = redraw_inputs()
+    start = time.perf_counter()
+    t = redraw_table(range(CHECK_REDRAWS), pairs, draws)
+    per = (time.perf_counter() - start) / CHECK_REDRAWS
+    key(
+        f"4: redraws 0 to {CHECK_REDRAWS - 1}, {len(t)} records: seconds per redraw {per:.3f}, "
+        f"projected for {REDRAWS} {per * REDRAWS:.1f} s"
+    )
+    assert per * REDRAWS <= LIMIT_S, "HARD STOP: the projection exceeds 7,200 seconds"
+
+
+def redraws():
+    start = time.perf_counter()
+    pairs, draws = redraw_inputs()
+    part_path(0).parent.mkdir(parents=True, exist_ok=True)
+    for k in range(REDRAWS // PART):
+        path = part_path(k)
+        if path.exists():
+            key(f"5: part {k} exists, skipped")
+            continue
+        began = time.perf_counter()
+        reps = range(k * PART, (k + 1) * PART)
+        tmp = path.with_suffix(".tmp")
+        redraw_table(reps, pairs, draws).to_parquet(tmp, index=False)
+        tmp.replace(path)
+        took = time.perf_counter() - began
+        key(f"5: part {k}, redraws {reps.start} to {reps.stop - 1}, {took:.1f} s")
+        elapsed = time.perf_counter() - start
+        if elapsed > LIMIT_S:
+            key(f"5: the run has taken {elapsed:.1f} s, more than {LIMIT_S}; stopping")
+            break
+    done = sum(part_path(k).exists() for k in range(REDRAWS // PART))
+    key(f"5: parts present {done} of {REDRAWS // PART}; {time.perf_counter() - start:.1f} s")
+
+
+def outcomes(out):
+    """Per budget, the redraws in which the squads differ and the P3 squad's actual value is above
+    the P2 squad's (wins), in which the squads are the same (identical), and in which they differ
+    and their actual values are equal (ties)."""
+    p3, p2 = (
+        out[out.predictor == p].set_index(["budget", "replicate"]).sort_index() for p in PREDICTORS
+    )
+    differ = p3.squad != p2.squad
+    counts = {
+        "wins": differ & (p3.actual > p2.actual),
+        "identical": ~differ,
+        "ties": differ & (p3.actual == p2.actual),
+    }
+    return pd.DataFrame({k: v.groupby(level="budget").sum() for k, v in counts.items()})
+
+
+def tally():
+    out = pd.concat(
+        [pd.read_parquet(part_path(k)) for k in range(REDRAWS // PART)], ignore_index=True
+    )
+    unique = not out.duplicated(["replicate", "budget", "predictor"]).any()
+    covered = set(out.replicate) == set(range(REDRAWS))
+    key(
+        f"6: rows {len(out)}, unique on replicate, budget and predictor {unique}, replicates 0 to "
+        f"{REDRAWS - 1} covered {covered}"
+    )
+    expected = (REDRAWS * len(BUDGETS) * len(PREDICTORS), True, True)
+    assert (len(out), unique, covered) == expected, "HARD STOP: the redraw records are incomplete"
+    out.to_parquet(redraws_path(), index=False)
+    key(f"6: wrote {redraws_path()} with {len(out)} rows, columns {list(out.columns)}")
+
+    pairs, draws = redraw_inputs()
+    again = redraw_table(range(CHECK_REDRAWS), pairs, draws)
+    stored = out[out.replicate < CHECK_REDRAWS].reset_index(drop=True)
+    cols = ["replicate", "budget", "predictor", "squad", "predicted", "actual", "cost"]
+    same = again[cols].equals(stored[cols])
+    key(
+        f"6: redraws 0 to {CHECK_REDRAWS - 1} solved again, every squad, predicted, actual and "
+        f"cost equal to the stored row {same}"
+    )
+    assert same, "HARD STOP: a redraw solved again differs from its stored record"
+
+    counts = outcomes(out)
+    counts["passes"] = counts.wins >= PASS
+    key(f"\n6: per budget, of {REDRAWS} redraws")
+    key(counts.to_string())
+    key("\n6: 2.5th and 97.5th percentiles over the redraws")
+    for b in BUDGETS.values():
+        for p in PREDICTORS:
+            s = out[(out.budget == b) & (out.predictor == p)]
+            for c in ["predicted", "actual"]:
+                lo, hi = np.percentile(s[c], [2.5, 97.5])
+                key(f"6: budget {b}, {p} squad, {c}: {lo!r} to {hi!r}")
+    n = out.groupby("replicate").n_pool.first()
+    key(f"\n6: n_pool smallest {n.min()}, median {n.median()!r}, largest {n.max()}")
+
+
 def main(argv):
     step = argv[0]
+    run = {
+        "inputs": inputs,
+        "pool": pool,
+        "budgets": costs,
+        "full": full_pool,
+        "timing": timing,
+        "redraws": redraws,
+        "tally": tally,
+    }[step]
     sh.LOGS.mkdir(parents=True, exist_ok=True)
     full = open(sh.LOGS / f"p7_{step}.log", "w", encoding="utf-8", errors="replace")
     brief = open(sh.LOGS / f"p7_{step}_summary.log", "w", encoding="utf-8", errors="replace")
     sys.stdout = Tee(full, brief)
     try:
-        if step == "inputs":
-            inputs()
-        elif step == "pool":
-            pool()
-        elif step == "budgets":
-            costs()
+        run()
     finally:
         sys.stdout = sys.__stdout__
         full.close()
