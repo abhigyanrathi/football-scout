@@ -1,8 +1,10 @@
 import math
 import sys
+import time
 
 import numpy as np
 import pandas as pd
+from scipy.stats import spearmanr
 
 from fbrecruit import shrinkage as sh
 from fbrecruit import split, squad
@@ -68,6 +70,49 @@ AGE_EDGES = [-np.inf, 23, 27, 31, np.inf]
 AGE_BANDS = ["under 23", "23 to 26", "27 to 30", "31 and over"]
 # z of 0.975 plus z of 0.8: a two-sided test at 5% with power 0.8
 Z = 2.80158
+LATER = (pd.Timestamp("2016-09-01"), pd.Timestamp("2018-08-31"))
+# per horizon in years, the range its later value is looked for in first
+HORIZONS = {
+    1: (pd.Timestamp("2017-05-01"), pd.Timestamp("2017-08-31")),
+    2: (pd.Timestamp("2018-05-01"), pd.Timestamp("2018-08-31")),
+}
+# in the order they are tried: a row gets the first that applies
+HOW = ["window", "carried", "price"]
+OUTCOMES = [
+    "value_1",
+    "value_1_date",
+    "how_1",
+    "outcome_1",
+    "value_2",
+    "value_2_date",
+    "how_2",
+    "outcome_2",
+]
+# from p8_prices_summary.log and p8_power_summary.log; the halves from the entry "Hidden-gem test,
+# by price"
+PRICED = 1166
+PRICED_TEAMS = 80
+WITH_2015 = 1130
+SPLIT = 4_000_000
+HALVES = (629, 537)
+BUDGET = 40_000_000
+REDRAWS = 2000
+# the top tenth of the priced players, rounded up
+HITS = 117
+RISE = 1.5
+SHUFFLES = 200
+RANDOM_SQUADS = 10_000
+SQUAD_LIST = [
+    "group",
+    "player_id",
+    "player_name",
+    "team_name",
+    "league",
+    "age",
+    "price",
+    "P3_full",
+    "value_1",
+]
 
 
 def value_path():
@@ -80,6 +125,18 @@ def decision_path():
 
 def scores_path():
     return PROCESSED / "gems_scores.parquet"
+
+
+def outcomes_path():
+    return PROCESSED / "gems_outcomes.parquet"
+
+
+def redraws_path():
+    return PROCESSED / "gems_redraws.parquet"
+
+
+def squads_path():
+    return PROCESSED / "gems_squads.parquet"
 
 
 def check_levels(c):
@@ -473,9 +530,225 @@ def power():
     key(f"5c: DE {de!r}, NEFF {neff!r}, MDE {mde!r}")
 
 
+def later_valuations():
+    """Transfermarkt valuations dated from 2016-09-01 to 2018-08-31, filtered as the file is
+    read."""
+    return pd.read_parquet(
+        INTERIM / "transfermarkt" / "player_valuations.parquet",
+        columns=["player_id", "date", "market_value_in_eur"],
+        filters=[("date", ">=", LATER[0]), ("date", "<=", LATER[1])],
+    )
+
+
+def priced_rows():
+    rows = pd.read_parquet(scores_path())
+    return rows[rows.reason == "priced"].reset_index(drop=True)
+
+
+def build_outcomes(rows, v):
+    """Per priced row and horizon, the later value, its date, how it was found and the log of its
+    ratio to the price: the latest valuation above zero in the horizon's range, else the latest
+    dated from 2016-09-01 to the range's end, else the price."""
+    ids = rows.tm_player_id.astype("int64")
+    v = v[(v.market_value_in_eur > 0) & v.player_id.isin(ids)]
+    price = rows.price.astype(float)
+    out = rows[[*KEYS, "tm_player_id", "price"]].copy()
+    for h, (start, end) in HORIZONS.items():
+        window, carried = latest(v, start, end), latest(v, LATER[0], end)
+        value = ids.map(window.market_value_in_eur).fillna(ids.map(carried.market_value_in_eur))
+        date = ids.map(window.date).fillna(ids.map(carried.date))
+        out[f"value_{h}"] = value.fillna(price).astype("int64")
+        out[f"value_{h}_date"] = date.fillna(rows.price_date)
+        found = [ids.isin(window.index), ids.isin(carried.index)]
+        out[f"how_{h}"] = np.select(found, HOW[:-1], default=HOW[-1])
+        out[f"outcome_{h}"] = np.log(out[f"value_{h}"] / price)
+    return out
+
+
+def outcomes():
+    rows = priced_rows()
+    key(f"2a: priced rows {len(rows)}")
+    assert len(rows) == PRICED, "HARD STOP: the priced rows differ from phase 8a"
+    v = later_valuations()
+    first, last = v.date.min(), v.date.max()
+    key(
+        f"2b: valuations read {len(v)}, above zero {int((v.market_value_in_eur > 0).sum())}, "
+        f"dated with a time of day {int((v.date != v.date.dt.normalize()).sum())}"
+    )
+    key(f"2b: smallest date read {first}, on or after 2016-09-01 {first >= LATER[0]}")
+    key(f"2b: largest date read {last}, on or before 2018-08-31 {last <= LATER[1]}")
+    assert first >= LATER[0] and last <= LATER[1], "HARD STOP: a valuation outside the range"
+
+    out = build_outcomes(rows, v)
+    for h in HORIZONS:
+        how, x = out[f"how_{h}"], out[f"outcome_{h}"]
+        key(f"\n2d: horizon {h}, rows per how_{h}")
+        key(how.value_counts().reindex(HOW, fill_value=0).to_string())
+        key(f"2d: outcome_{h} smallest {x.min()!r}, median {x.median()!r}, largest {x.max()!r}")
+        key(f"2d: horizon {h}, window values by the month of value_{h}_date")
+        months = out[f"value_{h}_date"][how == "window"].dt.to_period("M")
+        key(months.value_counts().sort_index().to_string())
+    out.to_parquet(outcomes_path(), index=False)
+    key(f"\n2e: wrote {outcomes_path()} with {len(out)} rows, columns {list(out.columns)}")
+
+
+def with_outcomes():
+    """The priced rows with their outcomes, in the order of the scores table."""
+    later = pd.read_parquet(outcomes_path(), columns=[*KEYS, *OUTCOMES])
+    return priced_rows().merge(later, on=KEYS, validate="one_to_one")
+
+
+def spearman(a, b):
+    return spearmanr(a, b).statistic
+
+
+def statistics(rows):
+    """Per horizon, the Spearman correlations of the gem score and of each baseline with the
+    outcome's residual, the momentum baseline's over the rows with a 2015 value, and the gem
+    score's less the raw baseline's; at one year, the gem score's within each price half. The
+    outcome fits are over all rows."""
+    x = controls(rows)
+    e = {h: ols(rows[f"outcome_{h}"].to_numpy(dtype=float), x)[1] for h in HORIZONS}
+    pre = rows.value_2015.notna().to_numpy()
+    low = rows.price.to_numpy(dtype=float) <= SPLIT
+    gem = rows.gem.to_numpy()
+    out = {}
+    for h, r in e.items():
+        out[f"gem_{h}"] = spearman(gem, r)
+        out[f"P2_{h}"] = spearman(rows.gem_P2.to_numpy(), r)
+        out[f"stats_{h}"] = spearman(rows.gem_stats.to_numpy(), r)
+        out[f"momentum_{h}"] = spearman(rows.momentum.to_numpy()[pre], r[pre])
+        out[f"diff_{h}"] = out[f"gem_{h}"] - out[f"P2_{h}"]
+    out["low_1"] = spearman(gem[low], e[1][low])
+    out["high_1"] = spearman(gem[~low], e[1][~low])
+    return out
+
+
+def redraw_table(rows, n=REDRAWS):
+    """The statistics of n redraws from a new generator seeded 0. Each draws every league's teams
+    with replacement, as many as it has, takes the drawn teams' rows team by team in draw order, a
+    team drawn k times giving its rows k times, and refits the score and outcome fits over them."""
+    rng = np.random.default_rng(0)
+    teams = {lg: np.sort(rows.team_id[rows.league == lg].unique()) for lg in LEAGUES}
+    at = rows.groupby(["league", "team_id"]).indices
+    out = []
+    for r in range(n):
+        drawn = []
+        for lg in LEAGUES:
+            drawn += [at[lg, t] for t in rng.choice(teams[lg], size=len(teams[lg]), replace=True)]
+        scored, _ = build_scores(rows.iloc[np.concatenate(drawn)].reset_index(drop=True))
+        out.append({"replicate": r, **statistics(scored)})
+    return pd.DataFrame(out)
+
+
+def shuffled(gem, league, e, n=SHUFFLES):
+    """Spearman correlations of e with gem permuted within each league, n times from a new
+    generator seeded 1."""
+    rng = np.random.default_rng(1)
+    out = []
+    for _ in range(n):
+        g = gem.copy()
+        for lg in LEAGUES:
+            at = league == lg
+            g[at] = rng.permutation(gem[at])
+        out.append(spearman(g, e))
+    return np.array(out)
+
+
+def gem_test():
+    start = time.perf_counter()
+    rows = with_outcomes()
+    teams = rows.groupby(["league", "team_id"]).ngroups
+    pre = int(rows.value_2015.notna().sum())
+    halves = int((rows.price <= SPLIT).sum()), int((rows.price > SPLIT).sum())
+    key(
+        f"3a: rows {len(rows)}, teams {teams}, with value_2015 {pre}, priced at or below {SPLIT} "
+        f"{halves[0]}, above it {halves[1]}"
+    )
+    expected = (PRICED, PRICED_TEAMS, WITH_2015, HALVES)
+    assert (len(rows), teams, pre, halves) == expected, "HARD STOP: the rows differ from phase 8a"
+
+    full = statistics(rows)
+    table = redraw_table(rows)
+    table.to_parquet(redraws_path(), index=False)
+    key(f"3d: wrote {redraws_path()} with {len(table)} rows, columns {list(table.columns)}")
+    key("\n3e: full data, 2.5th and 97.5th percentiles over the redraws")
+    ends = {s: np.percentile(table[s], [2.5, 97.5]) for s in full}
+    for s, value in full.items():
+        key(f"3e: {s}: {value!r}, {ends[s][0]!r} to {ends[s][1]!r}")
+    key(f"3e: 2.5th percentile of gem_1 above 0, the claim passes: {ends['gem_1'][0] > 0}")
+
+    rose = rows.value_1 / rows.price.astype(float) >= RISE
+    top = rows.sort_values(["gem", "player_id"], ascending=[False, True]).index[:HITS]
+    key(
+        f"\n3f: valued a year later at {RISE} times the price or more: of the {HITS} highest gem "
+        f"scores {int(rose[top].sum())}, of all {len(rows)} {int(rose.sum())}"
+    )
+    _, e1, _ = ols(rows.outcome_1.to_numpy(dtype=float), controls(rows))
+    r = shuffled(rows.gem.to_numpy(), rows.league.to_numpy(), e1)
+    key(
+        f"3g: {SHUFFLES} shuffles within league: mean {r.mean()!r}, largest absolute "
+        f"{np.abs(r).max()!r}"
+    )
+    key(f"3h: {time.perf_counter() - start:.1f} s")
+
+
+def squad_rows():
+    rows = with_outcomes()
+    return rows.assign(price=rows.price.astype("int64"))
+
+
+def random_squads(rows, budget, n=RANDOM_SQUADS):
+    """n squads filled in orders from a new generator seeded 0, with their cost, their players'
+    values a year later and the ratio of the two."""
+    price, group, player = (rows[c].to_numpy() for c in ("price", "group", "player_id"))
+    later = rows.value_1.to_numpy()
+    rng = np.random.default_rng(0)
+    out = []
+    for d in range(n):
+        pos = squad.fill(rng.permutation(len(rows)), price, group, player, budget)
+        cost, value = price[pos].sum(), later[pos].sum()
+        out.append((d, cost, value, value / cost))
+    return pd.DataFrame(out, columns=["draw", "cost", "later", "ratio"])
+
+
+def squads():
+    start = time.perf_counter()
+    rows = squad_rows()
+    budget = math.floor(10 * rows.price.median())
+    key(f"4a: rows {len(rows)}, budget {budget}")
+    assert budget == BUDGET, "HARD STOP: the budget is not 40,000,000"
+
+    pos = squad.pick(rows.P3_full, rows.price, rows.group, rows.player_id, budget)
+    price, later = rows.price.to_numpy(), rows.value_1.to_numpy()
+    cost, value = price[pos].sum(), later[pos].sum()
+    ratio = value / cost
+    key("\n4b: the squad picked with P3_full")
+    listed = rows.iloc[pos][SQUAD_LIST]
+    key(listed.to_string(index=False, formatters={"age": "{:.1f}".format}, float_format=repr))
+    key(f"4b: cost {cost!r}, later {value!r}, ratio {ratio!r}")
+
+    table = random_squads(rows, budget)
+    below = int((table.ratio < ratio).sum())
+    key(f"\n4c: random squads with a ratio below the pick's {below} of {len(table)}")
+    r = table.ratio
+    key(f"4c: ratio smallest {r.min()!r}, median {r.median()!r}, largest {r.max()!r}")
+    table.to_parquet(squads_path(), index=False)
+    key(f"4d: wrote {squads_path()} with {len(table)} rows, columns {list(table.columns)}")
+    key(f"4c: {time.perf_counter() - start:.1f} s")
+
+
 def main(argv):
     step = argv[0]
-    run = {"value": value, "prices": prices, "scores": scores, "power": power}[step]
+    run = {
+        "value": value,
+        "prices": prices,
+        "scores": scores,
+        "power": power,
+        "outcomes": outcomes,
+        "test": gem_test,
+        "squads": squads,
+    }[step]
     sh.LOGS.mkdir(parents=True, exist_ok=True)
     full = open(sh.LOGS / f"p8_{step}.log", "w", encoding="utf-8", errors="replace")
     brief = open(sh.LOGS / f"p8_{step}_summary.log", "w", encoding="utf-8", errors="replace")

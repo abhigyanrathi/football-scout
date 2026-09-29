@@ -24,6 +24,28 @@ REASONS = {
     "priced": 1166,
 }
 FIT_ROWS = {"gem": 1166, "gem_P2": 1166, "gem_stats": 1166, "momentum": 1130}
+# from p8_outcomes_summary.log, p8_test_summary.log and p8_squads_summary.log
+HOW = {
+    1: {"window": 1129, "carried": 30, "price": 7},
+    2: {"window": 1076, "carried": 87, "price": 3},
+}
+STATISTICS = {
+    "gem_1": 0.06636542795227626,
+    "P2_1": 0.038234886070613115,
+    "stats_1": 0.07636985421896036,
+    "momentum_1": 0.19589872275398498,
+    "diff_1": 0.028130541881663147,
+    "gem_2": 0.0911994618761879,
+    "P2_2": 0.05239233100140419,
+    "stats_2": 0.10324765040634543,
+    "momentum_2": 0.15328439605277958,
+    "diff_2": 0.038807130874783706,
+    "low_1": 0.05026822572719912,
+    "high_1": 0.12109371730783478,
+}
+GEM_1 = [0.006785671851836903, 0.12538372900239794]
+PICK = [3372, 3404, 3625, 3672, 3674, 7770, 11342, 23349, 40367, 40427]
+RATIO = 1.082810539523212
 
 
 def need(path):
@@ -228,3 +250,54 @@ def test_scores_step_reproduces_the_stored_table_and_its_fits():
 def test_no_valuation_after_the_summer_window_is_loaded():
     need(INTERIM / "transfermarkt" / "player_valuations.parquet")
     assert gems.valuations().date.max() <= pd.Timestamp("2016-08-31")
+
+
+def outcome_inputs():
+    need(gems.scores_path())
+    need(INTERIM / "transfermarkt" / "player_valuations.parquet")
+    return gems.priced_rows(), gems.later_valuations()
+
+
+def with_outcomes():
+    need(gems.scores_path())
+    need(gems.outcomes_path())
+    return gems.with_outcomes()
+
+
+def squad_rows():
+    need(gems.scores_path())
+    need(gems.outcomes_path())
+    return gems.squad_rows()
+
+
+@pytest.mark.slow
+def test_outcomes_step_reproduces_the_stored_table_and_its_counts():
+    stored = pd.read_parquet(need(gems.outcomes_path()))
+    got = gems.build_outcomes(*outcome_inputs())
+    pd.testing.assert_frame_equal(got, stored, check_exact=True)
+    for h, counts in HOW.items():
+        assert got[f"how_{h}"].value_counts().reindex(gems.HOW, fill_value=0).to_dict() == counts
+
+
+@pytest.mark.slow
+def test_full_data_statistics_and_the_first_redraws_match_the_stored_ones():
+    rows = with_outcomes()
+    got = gems.statistics(rows)
+    assert list(got) == list(STATISTICS)
+    for s, value in STATISTICS.items():
+        assert abs(got[s] - value) <= 1e-12
+    stored = pd.read_parquet(need(gems.redraws_path()))
+    pd.testing.assert_frame_equal(gems.redraw_table(rows, 5), stored.head(5), check_exact=True)
+    assert np.percentile(stored.gem_1, [2.5, 97.5]).tolist() == GEM_1
+
+
+@pytest.mark.slow
+def test_pick_and_the_first_random_squads_match_the_stored_ones():
+    rows = squad_rows()
+    pos = squad.pick(rows.P3_full, rows.price, rows.group, rows.player_id, gems.BUDGET)
+    assert rows.player_id.to_numpy()[pos].tolist() == PICK
+    price, later = rows.price.to_numpy(), rows.value_1.to_numpy()
+    assert abs(later[pos].sum() / price[pos].sum() - RATIO) <= 1e-12
+    stored = pd.read_parquet(need(gems.squads_path()))
+    again = gems.random_squads(rows, gems.BUDGET, 20)
+    pd.testing.assert_frame_equal(again, stored.head(20), check_exact=True)
