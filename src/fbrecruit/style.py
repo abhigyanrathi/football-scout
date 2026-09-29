@@ -194,6 +194,10 @@ def team_path():
     return PROCESSED / "style_team_w1.parquet"
 
 
+def window2_path():
+    return PROCESSED / "style_player_w2.parquet"
+
+
 def window1_games(window=1):
     """The games of window 1, or of the window given, with their home and away teams."""
     w = windows()
@@ -526,11 +530,80 @@ def reliability():
         key(f"4 {r.scope} {r.dimension}: n {r.n}, r {r.r!r}, spearman-brown {r.spearman_brown!r}")
 
 
+def window2():
+    """Window-2 profiles of every player-team with window-2 minutes, on the window-1 yardstick."""
+    w1 = pd.read_parquet(player_path())
+    pop = sh.population("pooled")
+    same = player_table(*window_inputs(1), pop).equals(w1)
+    key(
+        "5: the player table recomputed with the changed style.py equals style_player_w1.parquet "
+        f"in every column, NaN matching NaN: {same}"
+    )
+    assert same, "HARD STOP: style_player_w1.parquet is not reproduced"
+    key("5: lineup_groups on the window-1 lineups")
+    rule = sh.lineup_groups(sh.window1_lineups())
+    m = w1[[*KEYS, "group"]].merge(
+        rule, on=KEYS, how="outer", suffixes=("", "_rule"), indicator=True
+    )
+    differ = int(((m._merge != "both") | (m.group != m.group_rule)).sum())
+    key(f"5: window-1 rows {len(w1)}, rule rows {len(rule)}, keys or groups that differ {differ}")
+    assert differ == 0, "HARD STOP: the group rule does not reproduce every window-1 group"
+
+    games, a, press, lineups = window_inputs(2)
+    key(
+        f"\n5a: windows of the games read {sorted(games.window.unique().tolist())}; "
+        f"games {len(games)}, actions {len(a)}, pressure events {len(press)}, "
+        f"lineup rows {len(lineups)}"
+    )
+    player, _ = profiles_of(games, a, press, lineups)
+    t = sh.v2_table("pooled")
+    rows = t[t.window == 2][[*KEYS, "minutes"]].reset_index(drop=True)
+    m = rows.merge(player[[*KEYS, "n_sb_pressing"]], on=KEYS, how="outer", indicator=True)
+    only = int((m._merge != "both").sum())
+    gap = float((m.minutes - m.n_sb_pressing).abs().max())
+    key(
+        f"5a: v2 window-2 rows {len(rows)}, profile rows {len(player)}, keys in only one of them "
+        f"{only}; largest difference of the profile minutes from the v2 minutes {gap!r}"
+    )
+    assert only == 0 and gap <= 1e-9, "HARD STOP: the profiles are not the v2 table's window-2 rows"
+
+    rows = rows.merge(w1[[*KEYS, "group"]], on=KEYS, how="left", validate="one_to_one")
+    source = pd.Series(np.where(rows.group.notna(), "window 1", "window 2"), name="source")
+    key("5a: lineup_groups on the window-2 lineups")
+    rule = sh.lineup_groups(sh.window1_lineups(2))
+    new = rows[KEYS].merge(rule, on=KEYS, how="left", validate="one_to_one")
+    key(f"5a: window-2 rows with no row in the rule {int(new.group.isna().sum())}")
+    assert new.group.notna().all(), "HARD STOP: a window-2 row has no lineup rows"
+    rows["group"] = rows.group.fillna(new.group)
+
+    out = rows.merge(player, on=KEYS, how="left", validate="one_to_one")
+    out = standardize_players(out, moments(w1, pop)).rename(columns={"minutes": "window2_minutes"})
+    out = out[[c.replace("window1", "window2") for c in w1.columns]]
+    out.to_parquet(window2_path(), index=False)
+
+    z = [f"z_{d}" for d in DIMENSIONS]
+    unknown = out.group == "UNKNOWN"
+    key(f"\n5b: wrote {window2_path()} with {len(out)} rows, columns {list(out.columns)}")
+    came = {s: int(((source == s) & ~unknown).sum()) for s in ("window 1", "window 2")}
+    key(
+        f"5b: rows whose group came from window 1 {came['window 1']}, from window 2 "
+        f"{came['window 2']}, UNKNOWN {int(unknown.sum())}"
+    )
+    key(pd.crosstab(source, out.group).reindex(columns=sh.GROUPS, fill_value=0).to_string())
+    key("5b: how the groups taken from window 2 were resolved")
+    key(new.resolved_by[source == "window 2"].value_counts().to_string())
+    key("5b: non-null counts per dimension")
+    key(out[[*DIMENSIONS, *z]].notna().sum().to_string())
+    key(f"5b: infinite standard scores {int(np.isinf(out[z].to_numpy()).sum())}")
+    key(out.league.value_counts().reindex(list(LEAGUES)).to_string())
+
+
 def main(argv):
     step = argv[0]
+    name = "p9a_style" if step == "window2" else f"p4d_{step}"
     LOGS.mkdir(parents=True, exist_ok=True)
-    full = open(LOGS / f"p4d_{step}.log", "w", encoding="utf-8", errors="replace")
-    brief = open(LOGS / f"p4d_{step}_summary.log", "w", encoding="utf-8", errors="replace")
+    full = open(LOGS / f"{name}.log", "w", encoding="utf-8", errors="replace")
+    brief = open(LOGS / f"{name}_summary.log", "w", encoding="utf-8", errors="replace")
     sys.stdout = Tee(full, brief)
     try:
         if step == "pressures":
@@ -539,6 +612,8 @@ def main(argv):
             profiles()
         elif step == "reliability":
             reliability()
+        elif step == "window2":
+            window2()
     finally:
         sys.stdout = sys.__stdout__
         full.close()

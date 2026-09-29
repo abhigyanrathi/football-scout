@@ -35,6 +35,14 @@ CHECK_SEEDS = [1, 2, 3, 4]
 NEIGHBOURS = 10
 RESAMPLES = 2000
 E = [f"e{i}" for i in range(DIM)]
+SEEDS = [SEED, *CHECK_SEEDS]
+# the neighbour shares of seeds 1 to 4 pinned in tests/test_graph.py
+SHARES = {
+    1: 0.19628836545324768,
+    2: 0.186366880799429,
+    3: 0.20770877944325483,
+    4: 0.20528194147037832,
+}
 # the hidden-link areas of the first run, trained with a scored share of 0
 FIRST_AREAS = {"with links": 0.6762783544790465, "without links": 0.7581252043482103}
 # the float64 sum of the first run's pooled embeddings
@@ -47,6 +55,14 @@ def links_path():
 
 def embeddings_path():
     return PROCESSED / "embeddings_w1.parquet"
+
+
+def links2_path():
+    return PROCESSED / "graph_links_w2.parquet"
+
+
+def seeds_path():
+    return PROCESSED / "embeddings_seeds.parquet"
 
 
 def in_window1(frame, games):
@@ -161,13 +177,15 @@ def end_keys(links, s):
     return links[[f"{c}_{s}" for c in KEYS]].set_axis(KEYS, axis=1)
 
 
-def build_links(nodes):
-    games, a, press, _ = style.load_inputs()
+def build_links(nodes, window=1):
+    games, a, press, _ = style.window_inputs(window)
     press = press[in_window1(press, games)]
     outside = int((~in_window1(a, games)).sum()) + int((~in_window1(press, games)).sum())
-    key(f"2: window-1 games {len(games)}; actions {len(a)}, pressure events {len(press)}")
-    key(f"2: actions or pressure events from a game outside window 1: {outside}")
-    assert outside == 0, "HARD STOP: an action or pressure event is not from a window-1 game"
+    key(f"2: window-{window} games {len(games)}; actions {len(a)}, pressure events {len(press)}")
+    key(f"2: actions or pressure events from a game outside window {window}: {outside}")
+    assert outside == 0, (
+        f"HARD STOP: an action or pressure event is not from a window-{window} game"
+    )
 
     a = a.sort_values(["game_id", "period_id", "action_id"], kind="stable").reset_index(drop=True)
     passes = completed_passes(a)
@@ -352,6 +370,12 @@ def run(nodes, x, linked, seed, share, keep=None):
     z = embed(model, x, linked)
     info = {"rows": rows, "links": len(sub)} | stats
     return z, info | {"seconds": time.perf_counter() - start}
+
+
+def network(nodes, x, linked, seed):
+    """The pooled network of run, trained on every row and link, returned to embed other graphs."""
+    model, _ = train(x, linked, unlinked_pairs(nodes, linked), seed, SCORED)
+    return model
 
 
 def graph_inputs():
@@ -576,11 +600,80 @@ def margin(share):
     key(f"1e: resamples with a margin at or below zero {int((diffs <= 0).sum())}")
 
 
+def window2():
+    """The window-2 graph, and the window-1 and window-2 embeddings of the pooled network trained on
+    the window-1 graph with each of seeds 0 to 4."""
+    nodes1, names1, x1, linked1 = graph_inputs()
+    _, _, _, again = build_links(nodes1)
+    same = again.equals(pd.read_parquet(links_path()))
+    key(f"6: window-1 links recomputed with the changed graph.py equal graph_links_w1: {same}")
+    assert same, "HARD STOP: graph_links_w1.parquet is not reproduced"
+
+    nodes2 = pd.read_parquet(style.window2_path())
+    key(f"\n6a: nodes {len(nodes2)}, duplicate node keys {int(nodes2[KEYS].duplicated().sum())}")
+    assert not nodes2[KEYS].duplicated().any()
+    passes, kept, dropped, table = build_links(nodes2, 2)
+    table.to_parquet(links2_path(), index=False)
+    key("6a: per league")
+    key(show(link_stats(nodes2, passes, kept, dropped, table), 6))
+    key(f"6a: wrote {links2_path()} with {len(table)} rows, columns {list(table.columns)}")
+    key(table.kind.value_counts().to_string())
+
+    names2, x2 = features(nodes2)
+    linked2 = node_pairs(nodes2, table)
+    finite = bool(np.isfinite(x1).all() and np.isfinite(x2).all())
+    key(f"\n6c: feature columns {names1}; the same in window 2: {names2 == names1}")
+    key(f"6c: every input finite: {finite}")
+    assert names2 == names1 and finite, "HARD STOP: the window-2 inputs differ or are not finite"
+
+    saved = saved_pooled(nodes1)
+    regular = (nodes1.window1_minutes >= sh.W1_MINUTES).to_numpy()
+    base = nearest(saved[regular].astype(np.float64))
+    models, z1 = {}, {}
+    for seed in SEEDS:
+        start = time.perf_counter()
+        models[seed] = network(nodes1, x1, linked1, seed)
+        z1[seed] = embed(models[seed], x1, linked1)
+        key(f"6b seed {seed}: trained in {time.perf_counter() - start:.2f} s")
+        if seed == SEED:
+            same = np.array_equal(z1[seed], saved)
+            key(f"6b seed {seed}: window-1 embeddings equal the stored pooled rows: {same}")
+            assert same, "HARD STOP: seed 0 does not reproduce the stored pooled embeddings"
+            continue
+        near = nearest(z1[seed][regular].astype(np.float64))
+        share = float((near[:, :, None] == base[:, None, :]).any(2).mean(1).mean())
+        key(f"6b seed {seed}: neighbour share {share!r}, pinned {SHARES[seed]!r}")
+        assert share == SHARES[seed], "HARD STOP: a seed's neighbour share differs from the pinned"
+
+    z = {(1, s): z1[s] for s in SEEDS} | {(2, s): embed(models[s], x2, linked2) for s in SEEDS}
+    nodes = {1: nodes1, 2: nodes2}
+    out = pd.concat(
+        [
+            pd.concat(
+                [
+                    nodes[w][KEYS].assign(window=w, seed=s),
+                    pd.DataFrame(z[w, s].astype(np.float32), columns=E),
+                ],
+                axis=1,
+            )
+            for w, s in z
+        ],
+        ignore_index=True,
+    )
+    out.to_parquet(seeds_path(), index=False)
+    key(f"\n6c: wrote {seeds_path()} with {len(out)} rows, columns {list(out.columns)}")
+    norms = out.assign(norm=np.linalg.norm(out[E].to_numpy(np.float64), axis=1))
+    key("6c: embedding norms per window and seed (std with ddof 1)")
+    for (w, s), n in norms.groupby(["window", "seed"]).norm:
+        key(f"6c window {w} seed {s}: rows {len(n)}, mean norm {n.mean()!r}, std {n.std()!r}")
+
+
 def main(argv):
     step = argv[0]
+    name = "p9a_graph" if step == "window2" else f"p5_{step}"
     style.LOGS.mkdir(parents=True, exist_ok=True)
-    full = open(style.LOGS / f"p5_{step}.log", "w", encoding="utf-8", errors="replace")
-    brief = open(style.LOGS / f"p5_{step}_summary.log", "w", encoding="utf-8", errors="replace")
+    full = open(style.LOGS / f"{name}.log", "w", encoding="utf-8", errors="replace")
+    brief = open(style.LOGS / f"{name}_summary.log", "w", encoding="utf-8", errors="replace")
     sys.stdout = Tee(full, brief)
     try:
         if step == "links":
@@ -595,6 +688,8 @@ def main(argv):
             diagnose()
         elif step == "margin":
             margin(SCORED)
+        elif step == "window2":
+            window2()
     finally:
         sys.stdout = sys.__stdout__
         full.close()

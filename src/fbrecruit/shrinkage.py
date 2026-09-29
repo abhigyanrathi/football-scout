@@ -190,11 +190,11 @@ def preflight():
 # ---------------------------------------------------------------- step 2: position groups
 
 
-def window1_lineups():
+def window1_lineups(window=1):
     lu = minutes.load_lineups("statsbomb")
     w = windows()
     lw = lu.merge(w[["league", "game_id", "window"]], on=["league", "game_id"])
-    lw = lw[lw.window == 1].copy()
+    lw = lw[lw.window == window].copy()
     lw["team_id"] = lw.team_id.astype("int64")
     return lw
 
@@ -231,6 +231,20 @@ def modal_group(lw):
     key(f"2b: player-teams whose top two groups tie on minutes and appearances {int(tied.sum())}")
     best["group"] = best.group.where(~tied, "UNKNOWN")
     return best[[*KEYS, "group", "group_minutes"]]
+
+
+def lineup_groups(lw):
+    """build_groups' rule over the given lineup rows: each player-team's modal group, else its
+    Transfermarkt group, else UNKNOWN, and which of these resolved it."""
+    mapping = {n: group_of(n) for n in lw.starting_position_name.unique()}
+    best = modal_group(lw.assign(group=lw.starting_position_name.map(mapping)))
+    out = lw[KEYS].drop_duplicates().merge(best[[*KEYS, "group"]], on=KEYS, how="left")
+    missing = out.group.isna()
+    out["resolved_by"] = np.where(missing, "transfermarkt", "lineups")
+    out.loc[missing, "group"] = out.loc[missing, "player_id"].map(transfermarkt_groups())
+    out["resolved_by"] = out.resolved_by.where(out.group.notna(), "unresolved")
+    out["group"] = out.group.fillna("UNKNOWN")
+    return out.sort_values(KEYS).reset_index(drop=True)
 
 
 def build_groups():
