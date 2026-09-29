@@ -194,9 +194,10 @@ def team_path():
     return PROCESSED / "style_team_w1.parquet"
 
 
-def window1_games():
+def window1_games(window=1):
+    """The games of window 1, or of the window given, with their home and away teams."""
     w = windows()
-    w = w[w.window == 1]
+    w = w[w.window == window]
     cols = ["game_id", "home_team_id", "away_team_id"]
     teams = pd.concat(
         pd.read_parquet(OUT / lg / "games.parquet", columns=cols).assign(league=lg)
@@ -367,6 +368,34 @@ def load_inputs():
     return games, a, press, lineups.astype({"team_id": "int64"})
 
 
+def window_inputs(window):
+    """load_inputs for the games of one window, with each file read for those games only."""
+    games = window1_games(window)
+    frames, press, lineups = [], [], []
+    for lg in LEAGUES:
+        g = games[games.league == lg]
+        home = dict(zip(g.game_id, g.home_team_id, strict=True))
+        only = [("game_id", "in", g.game_id.tolist())]
+        a = pd.read_parquet(OUT / lg / "actions.parquet", filters=only)
+        frames += [
+            play_left_to_right(x, home[gid]).assign(league=lg) for gid, x in a.groupby("game_id")
+        ]
+        p = pd.read_parquet(OUT / lg / "pressures.parquet", filters=only)
+        press.append(p.assign(league=lg))
+        cols = ["game_id", "team_id", "player_id", "minutes_played"]
+        lu = pd.read_parquet(OUT / lg / "lineups.parquet", columns=cols, filters=only)
+        lineups.append(lu.assign(league=lg))
+    a = pd.concat(frames, ignore_index=True)
+    a["player_id"] = a.player_id.astype("int64")
+    a["type_name"] = a.type_id.map(dict(enumerate(spadl.actiontypes)))
+    a = a.sort_values(["game_id", "period_id", "action_id"]).reset_index(drop=True)
+    press = pd.concat(press)
+    assert press.player_id.notna().all()
+    press["player_id"] = press.player_id.astype("int64")
+    lineups = pd.concat(lineups, ignore_index=True)[[*KEYS, "game_id", "minutes_played"]]
+    return games, with_sequences(a), press, lineups.astype({"team_id": "int64"})
+
+
 def moments(player, pop):
     """Per group mean and standard deviation of each dimension over the estimation population."""
     est = player.merge(pop[KEYS], on=KEYS, validate="one_to_one")
@@ -384,6 +413,26 @@ def standardize_players(player, mom):
 
 def standardize_teams(team, ref):
     return team.assign(**{f"z_{d}": (team[d] - ref[d].mean()) / ref[d].std() for d in DIMENSIONS})
+
+
+def player_table(games, a, press, lineups, pop):
+    """The player table of the profiles step, standardized with the moments over pop, unwritten."""
+    player, _ = profiles_of(games, a, press, lineups)
+    rows = pd.read_parquet(sh.group_path())[[*KEYS, "group", "window1_minutes"]]
+    player = rows.merge(player, on=KEYS, how="left", validate="one_to_one")
+    return standardize_players(player, moments(player, pop))
+
+
+def split_halves(games, a, press, lineups, rows, mom):
+    """The rows' profiles on the odd and on the even game days of games, standardized with mom, over
+    the rows with minutes in both, as the reliability step computes them."""
+    halves = []
+    for parity in (1, 0):
+        p, _ = profiles_of(games[games.game_day % 2 == parity], a, press, lineups)
+        halves.append(standardize_players(rows.merge(p, on=KEYS, how="left"), mom))
+    odd, even = halves
+    both = ((odd.n_sb_pressing > 0) & (even.n_sb_pressing > 0)).to_numpy()
+    return odd[both].reset_index(drop=True), even[both].reset_index(drop=True)
 
 
 def profiles():
