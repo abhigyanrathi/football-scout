@@ -1,4 +1,5 @@
 import sys
+import time
 from pathlib import Path
 
 import numpy as np
@@ -6,7 +7,7 @@ import pandas as pd
 from socceraction.spadl import config as spadl
 from socceraction.spadl import play_left_to_right
 
-from fbrecruit import manifest, minutes
+from fbrecruit import gems, manifest, minutes
 from fbrecruit import shrinkage as sh
 from fbrecruit.logs import Tee, key, show
 from fbrecruit.paths import PROCESSED
@@ -35,6 +36,16 @@ PRESSURE_COLUMNS = [
     "game_id", "event_id", "period_id", "seconds", "team_id", "player_id", "position_name",
     "x", "y", "duration", "counterpress", "possession", "pressed_player_id",
 ]  # fmt: skip
+Z = [f"z_{d}" for d in DIMENSIONS]
+C = [f"c_{d}" for d in DIMENSIONS]
+# the dimensions whose value is a total over games over the total counted in n_; verticality's
+# n_ counts passes while its value is a ratio of passed distances
+RATIOS = ["possession", "buildup", "width", "depth", "dribble", "creation"]
+SPLITS = ["venue", "parity"]
+HALF_MINUTES = 450
+RELATIVE = 1e-12
+MINUTES_GAP = 1e-9
+CLUBS = 80
 
 
 def part_paths(league, game_id):
@@ -196,6 +207,26 @@ def team_path():
 
 def window2_path():
     return PROCESSED / "style_player_w2.parquet"
+
+
+def season_path():
+    return PROCESSED / "style_player_season.parquet"
+
+
+def team_season_path():
+    return PROCESSED / "style_team_season.parquet"
+
+
+def team_w2_path():
+    return PROCESSED / "style_team_w2.parquet"
+
+
+def dealing_path():
+    return PROCESSED / "style_dealing.parquet"
+
+
+def halves_path():
+    return PROCESSED / "style_halves_season.parquet"
 
 
 def window1_games(window=1):
@@ -400,6 +431,32 @@ def window_inputs(window):
     return games, with_sequences(a), press, lineups.astype({"team_id": "int64"})
 
 
+def season_games():
+    """The games of both windows, with their game days, windows and home and away teams."""
+    return pd.concat([window1_games(1), window1_games(2)], ignore_index=True)
+
+
+def league_inputs(games):
+    """window_inputs for the given games, all of one league, with each file read for those games
+    only."""
+    (lg,) = games.league.unique()
+    home = dict(zip(games.game_id, games.home_team_id, strict=True))
+    only = [("game_id", "in", games.game_id.tolist())]
+    a = pd.read_parquet(OUT / lg / "actions.parquet", filters=only)
+    frames = [play_left_to_right(x, home[gid]).assign(league=lg) for gid, x in a.groupby("game_id")]
+    a = pd.concat(frames, ignore_index=True)
+    a["player_id"] = a.player_id.astype("int64")
+    a["type_name"] = a.type_id.map(dict(enumerate(spadl.actiontypes)))
+    a = a.sort_values(["game_id", "period_id", "action_id"]).reset_index(drop=True)
+    press = pd.read_parquet(OUT / lg / "pressures.parquet", filters=only).assign(league=lg)
+    assert press.player_id.notna().all()
+    press["player_id"] = press.player_id.astype("int64")
+    cols = ["game_id", "team_id", "player_id", "minutes_played"]
+    lineups = pd.read_parquet(OUT / lg / "lineups.parquet", columns=cols, filters=only)
+    lineups = lineups.assign(league=lg)[[*KEYS, "game_id", "minutes_played"]]
+    return games, with_sequences(a), press, lineups.astype({"team_id": "int64"})
+
+
 def moments(player, pop):
     """Per group mean and standard deviation of each dimension over the estimation population."""
     est = player.merge(pop[KEYS], on=KEYS, validate="one_to_one")
@@ -437,6 +494,97 @@ def split_halves(games, a, press, lineups, rows, mom):
     odd, even = halves
     both = ((odd.n_sb_pressing > 0) & (even.n_sb_pressing > 0)).to_numpy()
     return odd[both].reset_index(drop=True), even[both].reset_index(drop=True)
+
+
+def alternate(rows, by):
+    """A and B in turn over the home games of each group of by from A and over its away games from
+    B, in the order of rows."""
+    turn = rows.groupby([*by, "home"]).cumcount() % 2
+    return np.where(rows.home == (turn == 0), "A", "B")
+
+
+def deal(games):
+    """Each club's games in matchday order, then game_id, with its halves of the season and of the
+    game's window, dealt by venue."""
+    cols = ["league", "game_id", "game_day", "window"]
+    rows = pd.concat(
+        [
+            games[cols].assign(team_id=games.home_team_id, home=True),
+            games[cols].assign(team_id=games.away_team_id, home=False),
+        ],
+        ignore_index=True,
+    )
+    rows = rows.sort_values([*TEAM_KEYS, "game_day", "game_id"]).reset_index(drop=True)
+    rows["half_season"] = alternate(rows, TEAM_KEYS)
+    rows["half_window"] = alternate(rows, [*TEAM_KEYS, "window"])
+    return rows[[*TEAM_KEYS, "game_id", "game_day", "home", "half_season", "half_window"]]
+
+
+def club_profiles(games, a, press, lineups, halves):
+    """Each club's player rows of profiles_of over its games in each of its halves; halves has one
+    row per club and game, with league, team_id, game_id and half."""
+    out = []
+    for (lg, team, half), h in halves.groupby([*TEAM_KEYS, "half"]):
+        p, _ = profiles_of(games[games.game_id.isin(h.game_id)], a, press, lineups)
+        out.append(p[(p.league == lg) & (p.team_id == team)].assign(half=half))
+    return pd.concat(out, ignore_index=True)
+
+
+def pooled(first, second):
+    """Per row of two aligned parts, each n_ summed and each value the n_-weighted mean of the
+    parts' values; a part with no row or an n_ of 0 adds nothing, and a sum of 0 gives NaN."""
+    out = {}
+    for d in DIMENSIONS:
+        n1 = first[f"n_{d}"].fillna(0).to_numpy(np.float64)
+        n2 = second[f"n_{d}"].fillna(0).to_numpy(np.float64)
+        s1 = np.where(n1 > 0, first[d].to_numpy(np.float64) * n1, 0.0)
+        s2 = np.where(n2 > 0, second[d].to_numpy(np.float64) * n2, 0.0)
+        n = n1 + n2
+        out[d] = np.where(n > 0, (s1 + s2) / np.where(n > 0, n, 1.0), np.nan)
+        out[f"n_{d}"] = n
+    return pd.DataFrame(out)
+
+
+def relative_gap(a, b):
+    """|a - b| / max(1, |a|, |b|), 0 where both are NaN and infinite where one is."""
+    a, b = np.asarray(a, np.float64), np.asarray(b, np.float64)
+    gap = np.abs(a - b) / np.maximum(1.0, np.maximum(np.abs(a), np.abs(b)))
+    both, one = np.isnan(a) & np.isnan(b), np.isnan(a) | np.isnan(b)
+    return np.where(both, 0.0, np.where(one, np.inf, gap))
+
+
+def identity_gaps(whole, first, second):
+    """Relative gaps of whole, taken over two parts, from them, the three frames aligned: of every
+    n_ from the parts' sum, of each value in RATIOS from their n_-weighted mean and, on rows with
+    minutes in one part only, of every value from that part's."""
+    p = pooled(first, second)
+    out = {
+        "n_": [relative_gap(whole[f"n_{d}"].fillna(0), p[f"n_{d}"]) for d in DIMENSIONS],
+        "values": [relative_gap(whole[d], p[d]) for d in RATIOS],
+        "one part": [],
+    }
+    has = [part.n_sb_pressing.fillna(0).to_numpy() > 0 for part in (first, second)]
+    for part, only in ((first, has[0] & ~has[1]), (second, has[1] & ~has[0])):
+        out["one part"] += [
+            relative_gap(whole[d].to_numpy()[only], part[d].to_numpy()[only]) for d in DIMENSIONS
+        ]
+    return {kind: np.concatenate(gaps) for kind, gaps in out.items()}
+
+
+def weighted_gap(whole, first, second, d):
+    """The largest relative gap of d from the n_-weighted mean of the parts' values, over the rows
+    with minutes in both parts."""
+    both = (first.n_sb_pressing.fillna(0) > 0) & (second.n_sb_pressing.fillna(0) > 0)
+    both = both.to_numpy()
+    gaps = relative_gap(whole[d].to_numpy()[both], pooled(first, second)[d].to_numpy()[both])
+    return float(np.max(gaps, initial=0.0))
+
+
+def centred(frame, centres, by):
+    """frame with c_ columns: each standard score less the centre of its row's group of by."""
+    c = frame[by].merge(centres.reset_index(), on=by, how="left", validate="many_to_one")
+    z = frame[Z].to_numpy(np.float64) - c[Z].to_numpy(np.float64)
+    return frame.assign(**dict(zip(C, z.T, strict=True)))
 
 
 def profiles():
@@ -598,9 +746,338 @@ def window2():
     key(out.league.value_counts().reindex(list(LEAGUES)).to_string())
 
 
+def tools_rows():
+    """gems_value.parquet, the scouting tools' players; HARD STOP unless one row per player, each
+    outfield with at least 900 minutes, on the keys of gems_scores.parquet."""
+    tools = pd.read_parquet(gems.value_path())
+    scored = pd.read_parquet(gems.scores_path(), columns=KEYS)[KEYS]
+    same = (
+        tools[KEYS]
+        .sort_values(KEYS)
+        .reset_index(drop=True)
+        .equals(scored.sort_values(KEYS).reset_index(drop=True))
+    )
+    outside = int((~tools.group.isin(sh.OUTFIELD)).sum())
+    key(
+        f"4a: tools' rows {len(tools)}; player_id unique {tools.player_id.is_unique}; groups "
+        f"outside the outfield {outside}; smallest minutes {tools.minutes.min()!r}; keys equal "
+        f"those of gems_scores.parquet ({len(scored)} rows): {same}"
+    )
+    ok = tools.player_id.is_unique and outside == 0 and same
+    assert ok and (tools.minutes >= gems.MINUTES).all(), "HARD STOP: the tools' rows"
+    key(tools.league.value_counts().reindex(list(LEAGUES)).to_string())
+    key(tools.group.value_counts().reindex(sh.OUTFIELD).to_string())
+    w1 = pd.read_parquet(player_path())
+    g1 = tools[KEYS].merge(w1[[*KEYS, "group"]], on=KEYS, how="left", validate="one_to_one").group
+    other = g1.notna().to_numpy() & (g1.to_numpy() != tools.group.to_numpy())
+    key(
+        f"4a: tools' rows with no row in style_player_w1 {int(g1.isna().sum())}, with another "
+        f"group there {int(other.sum())}"
+    )
+    return tools
+
+
+def reproduced(games):
+    """Each league's window-1 and window-2 profiles from its season inputs, one league at a time;
+    HARD STOP unless they reproduce style_player_w1, style_team_w1 and the raw dimensions and n_
+    columns of style_player_w2. Returns window 2's club profiles."""
+    parts = {w: ([], []) for w in (1, 2)}
+    for lg in LEAGUES:
+        g, a, press, lineups = league_inputs(games[games.league == lg])
+        for w, (players, teams) in parts.items():
+            p, t = profiles_of(g[g.window == w], a, press, lineups)
+            players.append(p)
+            teams.append(t)
+        del a, press, lineups
+    rows = pd.read_parquet(sh.group_path())[[*KEYS, "group", "window1_minutes"]]
+    p1 = pd.concat(parts[1][0], ignore_index=True)
+    player = rows.merge(p1, on=KEYS, how="left", validate="one_to_one")
+    player = standardize_players(player, moments(player, sh.population("pooled")))
+    team = pd.concat(parts[1][1]).sort_values(TEAM_KEYS).reset_index(drop=True)
+    stored = pd.read_parquet(window2_path())
+    p2 = pd.concat(parts[2][0], ignore_index=True)
+    w2 = stored[KEYS].merge(p2, on=KEYS, how="left", validate="one_to_one")
+    raw = [*KEYS, *[c for d in DIMENSIONS for c in (d, f"n_{d}")]]
+    same = {
+        "style_player_w1": player.equals(pd.read_parquet(player_path())),
+        "style_team_w1": standardize_teams(team, team).equals(pd.read_parquet(team_path())),
+        "the raw dimensions and n_ columns of style_player_w2": w2[raw].equals(stored[raw]),
+    }
+    for name, ok in same.items():
+        key(f"4: {name} reproduced by the changed style.py, NaN matching NaN: {ok}")
+    assert all(same.values()), "HARD STOP: a stored profile table is not reproduced"
+    return pd.concat(parts[2][1]).sort_values(TEAM_KEYS).reset_index(drop=True)
+
+
+def halves_of(games, dealing, rows, mom, venue):
+    """The rows' profiles on each half of the games, per split, from each club's games in the half,
+    one league at a time, with raw, n_ and standard scores: by venue with dealing's column venue,
+    and by parity with odd matchdays in half A. Also split_halves' odd and even rows on the
+    games."""
+    dealing = dealing.merge(games[["league", "game_id"]], on=["league", "game_id"])
+    splits = {
+        "venue": dealing[venue].to_numpy(),
+        "parity": np.where(dealing.game_day % 2 == 1, "A", "B"),
+    }
+    parts, odd, even = [], [], []
+    for lg in LEAGUES:
+        g, a, press, lineups = league_inputs(games[games.league == lg])
+        mine = rows[rows.league == lg][[*KEYS, "group"]]
+        for split, half in splits.items():
+            h = dealing[[*TEAM_KEYS, "game_id"]].assign(half=half)
+            p = club_profiles(g, a, press, lineups, h[h.league == lg])
+            parts.append(mine.merge(p, on=KEYS).assign(split=split))
+        o, e = split_halves(g, a, press, lineups, mine, mom)
+        odd.append(o)
+        even.append(e)
+        del a, press, lineups
+    halves = pd.concat(parts, ignore_index=True)
+    halves = standardize_players(halves[halves.n_sb_pressing > 0].reset_index(drop=True), mom)
+    return halves, pd.concat(odd, ignore_index=True), pd.concat(even, ignore_index=True)
+
+
+def parity_matches(halves, odd, even):
+    """Whether the parity halves' standard scores equal those of split_halves' odd and even rows,
+    exactly."""
+    par = halves[halves.split == "parity"]
+    same = []
+    for frame, half in ((odd, "A"), (even, "B")):
+        mine = frame[KEYS].merge(par[par.half == half], on=KEYS, how="left", validate="one_to_one")
+        a, b = mine[Z].to_numpy(np.float64), frame[Z].to_numpy(np.float64)
+        same.append(np.array_equal(a, b, equal_nan=True))
+    return all(same)
+
+
+def season_profiles(games):
+    """Each league's season profiles of its players and clubs, one league at a time; HARD STOP
+    unless the games read are the league's window-1 and window-2 games and the player rows are the
+    v2 table's rows over both windows, with their minutes."""
+    wins = windows()
+    players, teams = [], []
+    for lg in LEAGUES:
+        g, a, press, lineups = league_inputs(games[games.league == lg])
+        own = wins[(wins.league == lg) & wins.window.isin([1, 2])].game_id
+        exact = g.game_id.is_unique and len(g) == len(own) and set(g.game_id) == set(own)
+        stray = sum(int((~f.game_id.isin(g.game_id)).sum()) for f in (a, press, lineups))
+        key(
+            f"\n4b {lg}: games {len(g)}, window 1 {int((g.window == 1).sum())}, window 2 "
+            f"{int((g.window == 2).sum())}; actions {len(a)}, pressure events {len(press)}, "
+            f"lineup rows {len(lineups)}; the games are exactly the league's window-1 and "
+            f"window-2 games: {exact}; rows from another game {stray}"
+        )
+        assert exact and stray == 0, "HARD STOP: the games read are not the league's two windows"
+        p, club = profiles_of(g, a, press, lineups)
+        players.append(p)
+        teams.append(club)
+        del a, press, lineups
+    player = pd.concat(players, ignore_index=True)
+    t = sh.v2_table("pooled")
+    cols = [*KEYS, "minutes"]
+    v2 = t[t.window == 1][cols].merge(
+        t[t.window == 2][cols], on=KEYS, how="outer", suffixes=("_1", "_2"), validate="one_to_one"
+    )
+    v2["minutes"] = v2.minutes_1.fillna(0) + v2.minutes_2.fillna(0)
+    m = v2.merge(player[[*KEYS, "n_sb_pressing"]], on=KEYS, how="outer", indicator=True)
+    only = int((m._merge != "both").sum())
+    worst = float((m.minutes - m.n_sb_pressing).abs().max())
+    key(
+        f"\n4b: player rows {len(player)}, v2 keys over both windows {len(v2)}, keys in only one "
+        f"of them {only}; largest difference of n_sb_pressing from the window-1 plus window-2 "
+        f"minutes {worst!r}"
+    )
+    assert only == 0 and worst <= MINUTES_GAP, "HARD STOP: the player rows are not the v2 rows"
+    return player, pd.concat(teams).sort_values(TEAM_KEYS).reset_index(drop=True)
+
+
+def identity_report(label, whole, first, second):
+    """Print the identity gaps of whole from its two aligned parts, per kind; return the largest."""
+    worst = 0.0
+    for kind, gaps in identity_gaps(whole, first, second).items():
+        largest = float(np.max(gaps, initial=0.0))
+        worst = max(worst, largest)
+        key(
+            f"{label}, {kind}: values compared {len(gaps)}, largest relative difference {largest!r}"
+        )
+    return worst
+
+
+def window_identities(player, team, team2):
+    """HARD STOP unless every season player row and club is, in each n_ and each dimension of
+    RATIOS, the total over its windows' rows, and a row in one window has that window's values."""
+    w1, w2 = pd.read_parquet(player_path()), pd.read_parquet(window2_path())
+    sides = {
+        "players": (player, w1, w2, KEYS),
+        "clubs": (team, pd.read_parquet(team_path()), team2, TEAM_KEYS),
+    }
+    worst = 0.0
+    for name, (whole, one, two, by) in sides.items():
+        first = whole[by].merge(one, on=by, how="left", validate="one_to_one")
+        second = whole[by].merge(two, on=by, how="left", validate="one_to_one")
+        worst = max(worst, identity_report(f"4c {name}", whole, first, second))
+        for d in ("sb_pressing", "verticality"):
+            key(
+                f"4c {name}, as information: largest relative difference of {d} from the "
+                f"n_-weighted mean of its window values, rows in both windows, "
+                f"{weighted_gap(whole, first, second, d)!r}"
+            )
+    key(
+        "4c: left out of the value identity: sb_pressing, whose value divides high pressures by "
+        "minutes times the opponent's share (clubs: by the summed share) while n_ holds minutes "
+        "(clubs: games), and verticality, whose value divides forward by total passed distance "
+        "while n_ counts passes and crosses"
+    )
+    assert worst <= RELATIVE, "HARD STOP: a season value is not the total over its windows"
+
+
+def standard_scores(tools, player, team):
+    """The tools' rows with their season profiles and the clubs' season profiles, each with z_ and
+    c_ columns, and the players' moments and centres; HARD STOP if a standard deviation is 0 or not
+    finite or a club value is missing."""
+    rows = tools[[*KEYS, "group", "minutes"]].merge(
+        player, on=KEYS, how="left", validate="one_to_one"
+    )
+    gap = float((rows.minutes - rows.n_sb_pressing).abs().max())
+    key(f"\n4d: largest difference of the tools' rows' n_sb_pressing from their minutes {gap!r}")
+    mom = moments(rows, tools)
+    rows = standardize_players(rows, mom)
+    centres = rows.groupby(["league", "group"])[Z].mean()
+    rows = centred(rows, centres, ["league", "group"])
+    club_mom = team[DIMENSIONS].agg(["mean", "std"])
+    team = standardize_teams(team, team)
+    club_centres = team.groupby("league")[Z].mean()
+    team = centred(team, club_centres, ["league"])
+    key("4d: group means and standard deviations (ddof 1) over the tools' rows")
+    for grp in mom.index:
+        for d in DIMENSIONS:
+            mean, sd = mom.loc[grp, (d, "mean")], mom.loc[grp, (d, "std")]
+            key(f"4d {grp} {d}: mean {mean!r}, sd {sd!r}")
+    key("4d: centres, the mean standard score over the tools' rows of each league and group")
+    for (lg, grp), c in centres.iterrows():
+        key(f"4d centre {lg} {grp}: " + ", ".join(f"{d} {c[f'z_{d}']!r}" for d in DIMENSIONS))
+    key("4d: club means and standard deviations (ddof 1) over the season club profiles")
+    for d in DIMENSIONS:
+        key(f"4d clubs {d}: mean {club_mom.loc['mean', d]!r}, sd {club_mom.loc['std', d]!r}")
+    for lg, c in club_centres.iterrows():
+        key(f"4d club centre {lg}: " + ", ".join(f"{d} {c[f'z_{d}']!r}" for d in DIMENSIONS))
+    key("4d: missing standard scores among the tools' rows")
+    key(rows[Z].isna().sum().to_string())
+    sds = np.concatenate(
+        [mom.xs("std", axis=1, level=1).to_numpy().ravel(), club_mom.loc["std"].to_numpy()]
+    )
+    finite = bool(np.isfinite(sds).all() and (sds != 0).all())
+    missing = int(team[DIMENSIONS].isna().sum().sum())
+    key(f"4d: every standard deviation finite and not zero {finite}; missing club values {missing}")
+    assert finite and missing == 0, "HARD STOP: a standard deviation or a club value"
+    return rows, team, mom, centres
+
+
+def check_dealing(games, dealing):
+    """HARD STOP unless every game is dealt once for each of its two clubs and each club's halves
+    differ by at most one in games and in home games, over the season and in each window."""
+    cols = [*TEAM_KEYS, "game_id", "home"]
+    venues = [(games.home_team_id, True), (games.away_team_id, False)]
+    expect = pd.concat(
+        [games[["league", "game_id"]].assign(team_id=club, home=home) for club, home in venues],
+        ignore_index=True,
+    )[cols]
+    got = dealing[cols].sort_values(cols, ignore_index=True)
+    once = got.equals(expect.sort_values(cols, ignore_index=True))
+    key(
+        f"\n4f: dealing rows {len(dealing)}, games {len(games)}; every game dealt once for each "
+        f"of its two clubs {once}"
+    )
+    d = dealing.merge(games[["league", "game_id", "window"]], on=["league", "game_id"])
+    worst = 0
+    for scope, part, half in (
+        ("the season", d, "half_season"),
+        ("window 1", d[d.window == 1], "half_window"),
+        ("window 2", d[d.window == 2], "half_window"),
+    ):
+        n = part.groupby([*TEAM_KEYS, half]).agg(games=("game_id", "size"), home=("home", "sum"))
+        n = n.unstack(half, fill_value=0)
+        dg = int((n[("games", "A")] - n[("games", "B")]).abs().max())
+        dh = int((n[("home", "A")] - n[("home", "B")]).abs().max())
+        worst = max(worst, dg, dh)
+        key(
+            f"4f {scope}: clubs {len(n)}; largest difference between a club's halves in games "
+            f"{dg}, in home games {dh}"
+        )
+    assert once and worst <= 1, "HARD STOP: the dealing"
+
+
+def season_halves(games, dealing, rows, mom, centres):
+    """The rows of style_halves_season.parquet; HARD STOP unless the parity halves match
+    split_halves and, per split, every row's halves add up to his season row."""
+    halves, odd, even = halves_of(games, dealing, rows, mom, "half_season")
+    halves = centred(halves, centres, ["league", "group"])
+    same = parity_matches(halves, odd, even)
+    key(
+        f"\n4g: rows split_halves returns on the season's games {len(odd)}; the parity halves' "
+        f"standard scores equal its own exactly: {same}"
+    )
+    assert same, "HARD STOP: the parity halves differ from split_halves"
+    out, worst = [], 0.0
+    for split in SPLITS:
+        s = halves[halves.split == split]
+        first = rows[KEYS].merge(s[s.half == "A"], on=KEYS, how="left", validate="one_to_one")
+        second = rows[KEYS].merge(s[s.half == "B"], on=KEYS, how="left", validate="one_to_one")
+        m_a, m_b = first.n_sb_pressing.fillna(0), second.n_sb_pressing.fillna(0)
+        gap = float((m_a + m_b - rows.minutes).abs().max())
+        key(f"4g {split}: largest difference of the halves' minutes from the season's {gap!r}")
+        assert gap <= MINUTES_GAP, "HARD STOP: the halves' minutes do not add to the season's"
+        worst = max(worst, identity_report(f"4g {split}", rows, first, second))
+        for grp in sh.OUTFIELD:
+            at = rows.group == grp
+            both = int((at & (m_a > 0) & (m_b > 0)).sum())
+            each = int((at & (m_a >= HALF_MINUTES) & (m_b >= HALF_MINUTES)).sum())
+            key(
+                f"4g {split} {grp}: rows with minutes in both halves {both}, with at least "
+                f"{HALF_MINUTES} in each {each}"
+            )
+        out += [first[m_a > 0], second[m_b > 0]]
+    assert worst <= RELATIVE, "HARD STOP: a season value is not the total over its halves"
+    table = pd.concat(out, ignore_index=True)
+    table["minutes"] = table.n_sb_pressing.astype("int64")
+    raw = [*DIMENSIONS, *[f"n_{d}" for d in DIMENSIONS]]
+    return table[[*KEYS, "group", "split", "half", "minutes", *raw, *Z, *C]]
+
+
+def season():
+    start = time.perf_counter()
+    tools = tools_rows()
+    games = season_games()
+    team2 = reproduced(games)
+    player, team = season_profiles(games)
+    key(f"4b: club rows over the season {len(team)}, over window 2 {len(team2)}")
+    assert len(team) == len(team2) == CLUBS, "HARD STOP: a club table does not have 80 rows"
+    window_identities(player, team, team2)
+    rows, team, mom, centres = standard_scores(tools, player, team)
+
+    raw = [*DIMENSIONS, *[f"n_{d}" for d in DIMENSIONS]]
+    rows = rows[[*KEYS, "group", "minutes", *raw, *Z, *C]]
+    written = {
+        season_path(): rows,
+        team_season_path(): team[[*TEAM_KEYS, *raw, *Z, *C]],
+        team_w2_path(): team2[[*TEAM_KEYS, *raw]],
+    }
+    for path, frame in written.items():
+        frame.to_parquet(path, index=False)
+        key(f"\n4e: wrote {path} with {len(frame)} rows, columns {list(frame.columns)}")
+
+    dealing = deal(games)
+    check_dealing(games, dealing)
+    dealing.to_parquet(dealing_path(), index=False)
+    key(f"4f: wrote {dealing_path()} with {len(dealing)} rows, columns {list(dealing.columns)}")
+
+    table = season_halves(games, dealing, rows, mom, centres)
+    table.to_parquet(halves_path(), index=False)
+    key(f"4g: wrote {halves_path()} with {len(table)} rows, columns {list(table.columns)}")
+    key(f"4: {time.perf_counter() - start:.1f} s")
+
+
 def main(argv):
     step = argv[0]
-    name = "p9a_style" if step == "window2" else f"p4d_{step}"
+    name = {"window2": "p9a_style", "season": "p9b_season"}.get(step, f"p4d_{step}")
     LOGS.mkdir(parents=True, exist_ok=True)
     full = open(LOGS / f"{name}.log", "w", encoding="utf-8", errors="replace")
     brief = open(LOGS / f"{name}_summary.log", "w", encoding="utf-8", errors="replace")
@@ -614,6 +1091,8 @@ def main(argv):
             reliability()
         elif step == "window2":
             window2()
+        elif step == "season":
+            season()
     finally:
         sys.stdout = sys.__stdout__
         full.close()
