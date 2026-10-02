@@ -308,14 +308,17 @@ def costs():
     assert full <= levels[0.25] and not over.any(), "HARD STOP: a cheapest squad is over budget"
 
 
-def pick(values, prices, groups, players, budget, quotas=QUOTAS):
+def pick(values, prices, groups, players, budget, quotas=QUOTAS, marked=None, most=None):
     """The rows of highest summed value that fill each group's quota exactly, with summed price
-    at most the budget and at most one row per player; their positions in ascending order."""
+    at most the budget and at most one row per player; their positions in ascending order. Given
+    a boolean mask marked, at most most of the rows it marks."""
     values, prices = np.asarray(values, dtype=float), np.asarray(prices)
     groups, players = np.asarray(groups), np.asarray(players)
     unknown = sorted(set(groups) - set(quotas))
     if unknown:
         raise ValueError(f"groups without a quota: {unknown}")
+    if (marked is None) != (most is None):
+        raise ValueError("marked and most are given together or not at all")
     ids, rows = np.unique(players, return_counts=True)
     repeated = ids[rows > 1]
     # the solver works in millions of euros; the squad it returns is checked in whole euros
@@ -325,6 +328,11 @@ def pick(values, prices, groups, players, budget, quotas=QUOTAS):
     )
     lower = [*quotas.values(), -np.inf, *[-np.inf] * len(repeated)]
     upper = [*quotas.values(), budget / 1e6, *[1] * len(repeated)]
+    if marked is not None:
+        marked = np.asarray(marked, dtype=bool)
+        a = np.vstack([a, marked.astype(float)])
+        lower.append(-np.inf)
+        upper.append(most)
     res = milp(
         -values,
         integrality=np.ones(len(values)),
@@ -337,7 +345,12 @@ def pick(values, prices, groups, players, budget, quotas=QUOTAS):
     chosen = np.flatnonzero(res.x > 0.5)
     counts = {g: int((groups[chosen] == g).sum()) for g in quotas}
     cost = prices[chosen].sum()
-    if counts != quotas or cost > budget or len(set(players[chosen])) < len(chosen):
+    if (
+        counts != quotas
+        or cost > budget
+        or len(set(players[chosen])) < len(chosen)
+        or (marked is not None and marked[chosen].sum() > most)
+    ):
         raise RuntimeError(
             f"the squad breaks a rule: groups {counts}, cost {cost}, budget {budget}"
         )

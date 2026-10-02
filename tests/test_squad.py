@@ -9,6 +9,7 @@ from fbrecruit import squad
 from fbrecruit.sources.statsbomb import LEAGUES, OUT
 
 SIZES = {"CB": 3, "FB": 3, "MID": 4, "WIDE": 3, "FWD": 2}
+CAP_SIZES = {"CB": 4, "FB": 4, "MID": 6, "WIDE": 4, "FWD": 2}
 # from p7_pool_summary.log and p7_budgets_summary.log
 PAIR_REASONS = {
     "no Transfermarkt id": 9,
@@ -77,6 +78,56 @@ def test_pick_matches_brute_force(seed):
         assert abs(values[got].sum() - best[0][0]) <= 1e-9
         if len(best) == 1 or best[0][0] - best[1][0] > 1e-6:
             assert tuple(got) == best[0][1]
+
+
+def capped(seed):
+    """CAP_SIZES rows, twice each group's quota, with half of each group's rows marked at random;
+    the player of the first row, a CB, also holds the last, a FWD."""
+    rng = np.random.default_rng(seed)
+    groups = np.repeat(list(CAP_SIZES), list(CAP_SIZES.values()))
+    values = rng.normal(0.0, 1.0, len(groups))
+    prices = rng.integers(500_000, 50_000_001, len(groups))
+    players = np.arange(len(groups))
+    players[-1] = players[0]
+    marked = np.zeros(len(groups), dtype=bool)
+    for g in CAP_SIZES:
+        at = np.flatnonzero(groups == g)
+        marked[rng.choice(at, len(at) // 2, replace=False)] = True
+    return values, prices, groups, players, marked
+
+
+@pytest.mark.parametrize("most", [0, 1, 2])
+@pytest.mark.parametrize("seed", range(5))
+def test_pick_with_a_cap_matches_brute_force(seed, most):
+    values, prices, groups, players, marked = capped(seed)
+    squads = [
+        s
+        for s in every_squad(groups)
+        if len(set(players[list(s)])) == len(s) and marked[list(s)].sum() <= most
+    ]
+    if not squads:
+        with pytest.raises(RuntimeError):
+            squad.pick(values, prices, groups, players, prices.sum(), marked=marked, most=most)
+        return
+    costs = [prices[list(s)].sum() for s in squads]
+    low, high = min(costs), max(costs)
+    for budget in [low, high, (low + high) // 2]:
+        feasible = [s for s in squads if prices[list(s)].sum() <= budget]
+        best = sorted(((values[list(s)].sum(), s) for s in feasible), reverse=True)
+        got = squad.pick(values, prices, groups, players, budget, marked=marked, most=most)
+        assert marked[got].sum() <= most
+        assert abs(values[got].sum() - best[0][0]) <= 1e-9
+        if len(best) == 1 or best[0][0] - best[1][0] > 1e-6:
+            assert tuple(got) == best[0][1]
+
+
+def test_marked_and_most_are_given_together():
+    values, prices, groups, players = made_up(0)
+    budget = prices.sum()
+    with pytest.raises(ValueError):
+        squad.pick(values, prices, groups, players, budget, marked=np.ones(len(groups), dtype=bool))
+    with pytest.raises(ValueError):
+        squad.pick(values, prices, groups, players, budget, most=1)
 
 
 def test_a_player_with_two_rows_is_picked_once():
