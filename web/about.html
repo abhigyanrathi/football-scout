@@ -1,0 +1,98 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>About Football Scout</title>
+<meta name="description" content="What Football Scout does, how it works, what was tested and how each test came out.">
+<link rel="canonical" href="https://abhigyanrathi.github.io/football-scout/about.html">
+<meta property="og:type" content="website">
+<meta property="og:site_name" content="Football Scout">
+<meta property="og:title" content="About Football Scout">
+<meta property="og:description" content="What Football Scout does, how it works, what was tested and how each test came out.">
+<meta property="og:url" content="https://abhigyanrathi.github.io/football-scout/about.html">
+<meta property="og:image" content="https://abhigyanrathi.github.io/football-scout/assets/preview.png">
+<meta property="og:image:width" content="1200">
+<meta property="og:image:height" content="630">
+<meta property="og:image:alt" content="Football Scout's page for Leicester City: the club's style fingerprint beside its eight style scores.">
+<meta name="twitter:card" content="summary_large_image">
+<link rel="icon" href="assets/favicon.svg" type="image/svg+xml">
+<link rel="stylesheet" href="css/site.css">
+</head>
+<body>
+<a class="skip" href="#about">Skip to the text</a>
+<header class="masthead">
+  <div class="wrap">
+    <div class="brand">
+      <p class="site-name"><a href="./">Football Scout</a></p>
+      <p>Scouting for the summer of 2016, from the 2015/16 seasons of the Premier League, La Liga, Serie A and Ligue 1.</p>
+    </div>
+    <nav aria-label="Site">
+      <a href="./">Scouting tool</a>
+      <a href="about.html" aria-current="page">About</a>
+    </nav>
+  </div>
+</header>
+<main id="about" class="wrap prose" tabindex="-1">
+<h1>About Football Scout</h1>
+
+<p>Football Scout is a scouting tool for the 2015/16 season of four leagues: the Premier League, La Liga, Serie A and Ligue 1. Choose a club and it does what a recruitment team could have done in the summer of 2016: find players whose output looks high for their price, find players who play like one of the club's own, and plan the signings that would raise the club's side most within a budget.</p>
+
+<p>It covers the 1,247 outfield players who played at least 900 minutes for one club that season, 1,166 of them with a market valuation, and the 80 clubs of the four leagues.</p>
+
+<h2>How it works</h2>
+
+<p>A player's value is what his actions on the ball were worth per 90 minutes, measured with VAEP, which credits each action by how much it changed his side's chances of scoring and of conceding. Values are measured against the average of his league and shrunk toward what is usual for players of his position, league and playing time, so that a short run of good games counts for no more than it shows.</p>
+
+<p>A player's style is eight scores: pressing, possession, build-up speed, width, verticality, defensive depth, dribbling and shot creation, each measured against players of his position in his league. Each club has the same eight, measured against the clubs of its league.</p>
+
+<p>Prices are Transfermarkt valuations from the summer of 2016, shown in bands. Upgrade plans are solved exactly, as integer programs.</p>
+
+<h2>What was tested</h2>
+
+<p>The main claims each had a pass rule, fixed before the result was seen. The other figures below were reported beside them, without a rule. Figures in brackets are 95% intervals over 2,000 redraws of the teams.</p>
+
+<p><strong>Hidden gems.</strong> A player's gem score is how far his value lies above that of players of his price, age, league and position. Players with higher gem scores in the summer of 2016 did gain more market value over the next year than players like them, but only just: the correlation was 0.066 (0.007 to 0.125), so the test passed narrowly. Market momentum, a player's price over his valuation a year earlier, did better, at 0.196 (0.131 to 0.259), so the site shows it in a column of its own. Among the cheaper half of the players the gem score's correlation was 0.050 (−0.026 to 0.128), and among the dearer half 0.121 (0.020 to 0.215). Of the 117 players with the highest gem scores, 17 were valued at one and a half times their price or more a year later, against 152 of all 1,166.</p>
+
+<p><strong>Playing style.</strong> A player's style over the first 23 matchdays picked him out from his teammates in the same position over the last 15 for 621 of 863 players, where chance would give 324 (a gain over chance of 0.344, from 0.316 to 0.372). So the matches in Replace a player mean something. The closest few, though, are often as close to the player as he is to himself across two halves of a season, and the site marks those as within the noise.</p>
+
+<p><strong>Style fit.</strong> Adding a player's fit with his club's style to the model that predicts his value did not pass its test: the model with fit had the smaller error in 1,193 of 2,000 redraws, against a pass mark of 1,950. The site offers fit as a search preference and nothing more.</p>
+
+<p><strong>Upgrade plans.</strong> Plans use the shrunk values, which should keep a plan from favouring players whose estimates are too high. Against the same pick made with unshrunk values, the shrunk pick did better in 1,339, 1,154 and 1,085 of 2,000 redraws at its three test budgets, against a pass mark of 1,950, so it passed at none of them. It did beat 9,988 of 10,000 random squads at the main budget. A €40 million squad picked this way in the summer of 2016 was valued at 1.083 times its cost a year later, above 5,765 of 10,000 random squads at that budget. Read the plans as suggestions, not forecasts.</p>
+
+<p><strong>Network embeddings.</strong> An embedding of whom each player combines with in his team, learned with GraphSAGE, was tested as an addition to the style search and left out: it raised the search's mean reciprocal rank by 0.016 (−0.002 to 0.036).</p>
+
+<h2>Reading the numbers</h2>
+
+<ul>
+<li>Values are measured against each player's league level, so a plan that moves a player between leagues assumes his output carries over.</li>
+<li>The ranges beside values and plan gains are 90% intervals of the noise in each player's estimate, nothing more.</li>
+<li>A club's shape is how its minutes split across positions, rounded to ten places. It is not a formation, and a few shapes are artifacts of the rounding.</li>
+<li>One year later is hindsight that a buyer in the summer of 2016 did not have.</li>
+</ul>
+
+<h2>Where it came from</h2>
+
+<p>Football Scout began as a college group project, System-Aware Football Recruitment, which we presented to our supervisor. Its code was lost, so I rebuilt it from the presentation: the aims are the original's, parts of the design are reworked, and every number here was computed afresh. None comes from the original presentation.</p>
+
+<h2>Data and credits</h2>
+
+<p>Event data: <a href="https://github.com/statsbomb/open-data">StatsBomb open data</a>.</p>
+
+<p>Market valuations: Transfermarkt, through the <a href="https://github.com/dcaribou/transfermarkt-datasets">transfermarkt-datasets</a> project.</p>
+
+<p>Built by Abhigyan Rathi as a non-commercial project. The code is on <a href="https://github.com/abhigyanrathi/football-scout">GitHub</a>.</p>
+</main>
+<footer class="credits">
+  <div class="wrap">
+    <img src="assets/hudl-statsbomb-logo-reversed.png" alt="Hudl StatsBomb" width="2258" height="344" loading="lazy">
+    <p>Event data: <a href="https://github.com/statsbomb/open-data">StatsBomb open data</a></p>
+    <p>Market valuations: <a href="https://github.com/dcaribou/transfermarkt-datasets">Transfermarkt</a></p>
+    <ul>
+      <li><a href="about.html">About</a></li>
+      <li><a href="https://github.com/abhigyanrathi/football-scout">GitHub</a></li>
+    </ul>
+  </div>
+</footer>
+</body>
+</html>

@@ -1,0 +1,68 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Football Scout</title>
+<meta name="description" content="Scouting for the summer of 2016, from the 2015/16 seasons of the Premier League, La Liga, Serie A and Ligue 1.">
+<link rel="canonical" href="https://abhigyanrathi.github.io/football-scout/">
+<meta property="og:type" content="website">
+<meta property="og:site_name" content="Football Scout">
+<meta property="og:title" content="Football Scout">
+<meta property="og:description" content="Scouting for the summer of 2016, from the 2015/16 seasons of the Premier League, La Liga, Serie A and Ligue 1.">
+<meta property="og:url" content="https://abhigyanrathi.github.io/football-scout/">
+<meta property="og:image" content="https://abhigyanrathi.github.io/football-scout/assets/preview.png">
+<meta property="og:image:width" content="1200">
+<meta property="og:image:height" content="630">
+<meta property="og:image:alt" content="Football Scout's page for Leicester City: the club's style fingerprint beside its eight style scores.">
+<meta name="twitter:card" content="summary_large_image">
+<link rel="icon" href="assets/favicon.svg" type="image/svg+xml">
+<link rel="stylesheet" href="css/site.css">
+<script type="module" src="js/app.js"></script>
+</head>
+<body>
+<a class="skip" href="#tool">Skip to the scouting tool</a>
+<header class="masthead">
+  <div class="wrap">
+    <div class="brand">
+      <h1 class="site-name">Football Scout</h1>
+      <p>Scouting for the summer of 2016, from the 2015/16 seasons of the Premier League, La Liga, Serie A and Ligue 1.</p>
+    </div>
+    <nav aria-label="Site">
+      <a href="./" aria-current="page">Scouting tool</a>
+      <a href="about.html">About</a>
+    </nav>
+    <div class="search">
+      <label for="player-search">Find a player</label>
+      <input id="player-search" type="text" role="combobox" aria-autocomplete="list" aria-expanded="false" aria-controls="player-suggestions" autocomplete="off" spellcheck="false" disabled>
+      <ul id="player-suggestions" role="listbox" aria-label="Players" hidden></ul>
+      <p id="search-status" role="status"></p>
+    </div>
+  </div>
+</header>
+<main id="tool" class="wrap" tabindex="-1">
+  <p id="status" class="waiting" hidden>Loading the data. The club and its lists will appear here.</p>
+  <p id="load-error" class="error" role="alert" hidden>Couldn't load the data. If you opened this file directly, serve the folder instead: <code>python -m http.server</code>.</p>
+  <noscript><p class="error">The scouting tool needs JavaScript. The <a href="about.html">About page</a> does not.</p></noscript>
+  <script>
+    /* opened as a file, the module cannot load, so the message for that is shown from here */
+    document.getElementById(location.protocol === "file:" ? "load-error" : "status").hidden = false;
+  </script>
+  <section id="club" aria-labelledby="club-name" hidden></section>
+  <nav id="views" class="views" aria-label="Views" hidden></nav>
+  <section id="view" aria-labelledby="view-title"></section>
+</main>
+<footer class="credits">
+  <div class="wrap">
+    <img src="assets/hudl-statsbomb-logo-reversed.png" alt="Hudl StatsBomb" width="2258" height="344" loading="lazy">
+    <p>Event data: <a href="https://github.com/statsbomb/open-data">StatsBomb open data</a></p>
+    <p>Market valuations: <a href="https://github.com/dcaribou/transfermarkt-datasets">Transfermarkt</a></p>
+    <ul>
+      <li><a href="about.html">About</a></li>
+      <li><a href="https://github.com/abhigyanrathi/football-scout">GitHub</a></li>
+    </ul>
+  </div>
+</footer>
+<dialog id="detail" aria-labelledby="detail-name"></dialog>
+</body>
+</html>
