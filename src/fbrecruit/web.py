@@ -1,11 +1,13 @@
 """The scouting site's data files, built from the scouting tools' and hidden-gem tables."""
 
 import hashlib
+import itertools
 import json
 import math
 import shutil
 import sys
 import time
+from collections import Counter
 
 import numpy as np
 import pandas as pd
@@ -14,7 +16,7 @@ from fbrecruit import gems, scout, squad, style
 from fbrecruit import shrinkage as sh
 from fbrecruit.links import data
 from fbrecruit.logs import Tee, key
-from fbrecruit.paths import ROOT
+from fbrecruit.paths import PROCESSED, ROOT
 from fbrecruit.sources.statsbomb import LEAGUES
 
 KEYS = sh.KEYS
@@ -55,6 +57,9 @@ LEAGUE_LABELS = {
 }
 # in the order they are tried: a plan gets the first that applies
 REASONS = ["more places than signings", "too few candidates", "budget too small"]
+PLACES = 10
+# in the order they are tried: a player-team takes its group from the first that holds its key
+SOURCES = ["gems_value", "player_group", "style_player_w2"]
 # from p9b_season_summary.log and p9b_tools_summary.log
 PLAYERS = 1247
 GROUPS = {"CB": 257, "FB": 254, "MID": 284, "WIDE": 286, "FWD": 166}
@@ -93,7 +98,8 @@ def style_scores(values):
 
 def inputs():
     """The tables the files are built from, each with the columns used."""
-    value = pd.read_parquet(gems.value_path())
+    ids = {"player_id": "int64", "team_id": "int64"}
+    value = pd.read_parquet(gems.value_path()).astype(ids)
     cols = [*KEYS, "price", "value_2015", "age", "reason"]
     decision = pd.read_parquet(gems.decision_path(), columns=cols)
     gem = pd.read_parquet(gems.scores_path(), columns=[*KEYS, "gem"])
@@ -105,7 +111,12 @@ def inputs():
     cols = [*KEYS, "player_id_c", "distance", "closeness"]
     pairs = pd.read_parquet(scout.pairs_path(), columns=cols)
     names = data.statsbomb_players()[[*KEYS, "nickname"]]
-    return value, decision, gem, later, season, teams, fit, pairs, names
+    cols = ["league", "team_id", "player_id", "minutes"]
+    path = PROCESSED / "minutes_player_team_statsbomb.parquet"
+    mins = pd.read_parquet(path, columns=cols).astype(ids)
+    w1 = pd.read_parquet(sh.group_path(), columns=[*KEYS, "group"]).astype(ids)
+    w2 = pd.read_parquet(style.window2_path(), columns=[*KEYS, "group"]).astype(ids)
+    return value, decision, gem, later, season, teams, fit, pairs, names, mins, w1, w2
 
 
 def player_rows(value, decision, gem, later, season, names):
@@ -187,7 +198,7 @@ def club_table(teams, rows):
     return t.sort_values(["order", "name", "team_id"]).reset_index(drop=True)
 
 
-def club_records(clubs, rows):
+def club_records(clubs, rows, shapes):
     """One record per club, in the order of clubs."""
     out = []
     for c in clubs.itertuples():
@@ -198,16 +209,62 @@ def club_records(clubs, rows):
                 "league": c.league,
                 "name": c.name,
                 "style": style_scores(getattr(c, col) for col in style.C),
+                "shape": shapes[c.key],
                 "players": sorted(int(p) for p in own),
             }
         )
     return out
 
 
-def needs(groups, quotas=squad.QUOTAS):
-    """Per group, the places the own players of these groups leave open."""
+def season_groups(season, value, w1, w2):
+    """The rows of the season's minutes table with minutes above 0, each with its group from the
+    first of gems_value, player_group and style_player_w2 that holds its key, and that table's
+    name as its source."""
+    assert (season.minutes % 1 == 0).all(), "HARD STOP: a minutes value that is not whole"
+    m = value[[*KEYS, "minutes"]].merge(
+        season[[*KEYS, "minutes"]], on=KEYS, how="left", suffixes=("", "_s"), validate="one_to_one"
+    )
+    assert (m.minutes == m.minutes_s).all(), "HARD STOP: gems_value's minutes"
+    tables = dict(zip(SOURCES, (value, w1, w2), strict=True))
+    for a, b in itertools.pairwise(SOURCES):
+        both = tables[a][[*KEYS, "group"]].merge(
+            tables[b][[*KEYS, "group"]], on=KEYS, suffixes=("", "_b"), validate="one_to_one"
+        )
+        assert (both.group == both.group_b).all(), f"HARD STOP: the groups of {a} and {b}"
+    rows = season[season.minutes > 0]
+    for name, t in tables.items():
+        g = t[[*KEYS, "group"]].rename(columns={"group": name})
+        rows = rows.merge(g, on=KEYS, how="left", validate="one_to_one")
+    held = [rows[s].notna() for s in SOURCES]
+    rows = rows.assign(
+        group=np.select(held, [rows[s] for s in SOURCES], default=None),
+        source=np.select(held, SOURCES, default=None),
+    ).drop(columns=SOURCES)
+    assert rows.group.notna().all(), "HARD STOP: a row with minutes and no group"
+    assert rows.group.isin(sh.GROUPS).all(), "HARD STOP: a group outside sh.GROUPS"
+    return rows
+
+
+def shape_of(minutes):
+    """The PLACES places of a ten shared among the outfield groups in proportion to their
+    minutes, by largest remainder: each group takes the whole part of its share, and the places
+    left go one each to the groups with the largest remainders, a tie to the group earlier in
+    sh.OUTFIELD."""
+    m = {g: int(minutes[g]) for g in sh.OUTFIELD}
+    total = sum(m.values())
+    assert total > 0, "HARD STOP: a shape from no outfield minutes"
+    shape = {g: PLACES * x // total for g, x in m.items()}
+    left = PLACES - sum(shape.values())
+    # sorted is stable, so a tie keeps the order of sh.OUTFIELD
+    for g in sorted(sh.OUTFIELD, key=lambda h: -(PLACES * m[h] % total))[:left]:
+        shape[g] += 1
+    return shape
+
+
+def needs(groups, shape):
+    """Per group, the places of the shape the own players of these groups leave open."""
     groups = np.asarray(groups)
-    return {g: max(0, q - int((groups == g).sum())) for g, q in quotas.items()}
+    return {g: max(0, n - int((groups == g).sum())) for g, n in shape.items()}
 
 
 def infeasible(need, groups, prices, k, budget):
@@ -223,31 +280,32 @@ def infeasible(need, groups, prices, k, budget):
     return None
 
 
-def solve(own, cands, budget, k):
-    """The plan's rows: the own players at no cost and at most k candidates at their prices."""
+def solve(own, cands, budget, k, shape):
+    """The plan's rows in the shape: the own players at no cost and at most k candidates at their
+    prices."""
     rows = pd.concat([own.assign(price=0), cands], ignore_index=True)
     marked = np.arange(len(rows)) >= len(own)
     args = rows.P3_full, rows.price, rows.group, rows.player_id, budget
-    return rows.iloc[squad.pick(*args, marked=marked, most=k)]
+    return rows.iloc[squad.pick(*args, quotas=shape, marked=marked, most=k)]
 
 
-def club_plans(own, cands, budgets=BUDGETS, caps=CAPS):
-    """A club's baseline, the places its own players leave open and its plans, by budget, then
-    cap, then without and with the fit condition. A plan's rows are None if it cannot be
-    filled."""
-    need = needs(own.group)
+def club_plans(own, cands, shape, budgets=BUDGETS, caps=CAPS):
+    """A club's baseline, the places of its shape its own players leave open and its plans, by
+    budget, then cap, then without and with the fit condition. A plan's rows are None if it
+    cannot be filled."""
+    need = needs(own.group, shape)
     short = {g: n for g, n in need.items() if n}
     base = None
     if not short:
         free = np.zeros(len(own), dtype=np.int64)
-        base = own.iloc[squad.pick(own.P3_full, free, own.group, own.player_id, 0)]
+        base = own.iloc[squad.pick(own.P3_full, free, own.group, own.player_id, 0, quotas=shape)]
     plans = []
     for budget in budgets:
         for k in caps:
             for condition in (False, True):
                 c = cands[cands.score > 0] if condition else cands
                 reason = infeasible(need, c.group, c.price, k, budget)
-                rows = None if reason else solve(own, c, budget, k)
+                rows = None if reason else solve(own, c, budget, k, shape)
                 plans.append(
                     {"budget": budget, "cap": k, "fit": condition, "reason": reason, "rows": rows}
                 )
@@ -293,13 +351,14 @@ def plan_record(plan, own, base):
     }
 
 
-def check_club(own, base, plans, score, prices):
-    """HARD STOP unless the baseline is own players only and fills the quotas, and every plan
-    filled fills them within its budget with at most its cap of signings, each with a fit row
-    for the club, priced and, under the fit condition, with a fit score above 0. score holds the
-    club's fit scores and prices the priced players' prices, each by player_id."""
+def check_club(own, base, plans, score, prices, shape):
+    """HARD STOP unless the baseline is own players only and fills the shape, and every plan
+    filled fills it within its budget with at most its cap of signings, each with a fit row for
+    the club, priced and, under the fit condition, with a fit score above 0. A ten's players are
+    counted in every group of the shape, those with no places included. score holds the club's
+    fit scores and prices the priced players' prices, each by player_id."""
     if base is not None:
-        filled = base.group.value_counts().to_dict() == squad.QUOTAS
+        filled = {g: int((base.group == g).sum()) for g in shape} == shape
         assert filled and base.player_id.isin(own.player_id).all(), "HARD STOP: a baseline"
     for p in plans:
         rows = p["rows"]
@@ -307,7 +366,7 @@ def check_club(own, base, plans, score, prices):
             continue
         signed = rows.player_id[~rows.player_id.isin(own.player_id)]
         ok = (
-            rows.group.value_counts().to_dict() == squad.QUOTAS
+            {g: int((rows.group == g).sum()) for g in shape} == shape
             and signed.isin(score.index).all()
             and signed.isin(prices.index).all()
             and prices.reindex(signed).sum() <= p["budget"]
@@ -349,7 +408,6 @@ def meta(counts):
         "bands": BAND_LABELS,
         "budgets_m": [b // 1_000_000 for b in BUDGETS],
         "caps": CAPS,
-        "quotas": squad.QUOTAS,
         "interval": 0.9,
         "noise_closeness": NOISE,
         "fit_condition": 0,
@@ -420,7 +478,7 @@ def digest(files):
 
 def build(out=OUT):
     start = time.perf_counter()
-    value, decision, gem, later, season, teams, fit, pairs, names = inputs()
+    value, decision, gem, later, season, teams, fit, pairs, names, mins, w1, w2 = inputs()
     rows = player_rows(value, decision, gem, later, season, names)
     priced = rows[rows.reason == "priced"]
     groups = {g: int((rows.group == g).sum()) for g in sh.OUTFIELD}
@@ -470,6 +528,49 @@ def build(out=OUT):
 
     table = club_table(teams, rows)
     assert table["name"].notna().all(), "HARD STOP: a club without a name"
+
+    held = set(zip(mins.league, mins.team_id, strict=True))
+    known = set(zip(teams.league, teams.team_id, strict=True))
+    assert held == known and len(held) == style.CLUBS, "HARD STOP: the clubs of the minutes table"
+    played = season_groups(mins, value, w1, w2)
+    sources = {s: int((played.source == s).sum()) for s in SOURCES}
+    key(
+        f"10a: shape rows {len(mins)}, with minutes above 0 {len(played)}, groups from gems_value "
+        f"{sources['gems_value']}, from player_group {sources['player_group']}, from "
+        f"style_player_w2 {sources['style_player_w2']}"
+    )
+    g1, g2 = (
+        value[KEYS].merge(t[[*KEYS, "group"]], on=KEYS, how="left", validate="one_to_one").group
+        for t in (w1, w2)
+    )
+    alone = g1.isna().to_numpy()
+    other = alone & g2.notna().to_numpy() & (g2.to_numpy() != value.group.to_numpy())
+    key(
+        f"10a: tools' rows not in player_group {int(alone.sum())}, with another group in "
+        f"style_player_w2 {int(other.sum())}"
+    )
+    per = played.groupby(["league", "team_id", "group"]).minutes.sum().unstack(fill_value=0)
+    per = per.reindex(
+        index=pd.MultiIndex.from_frame(table[style.TEAM_KEYS]), columns=sh.GROUPS, fill_value=0
+    )
+    outfield = per[sh.OUTFIELD].sum(axis=1)
+    share = per.UNKNOWN / (outfield + per.UNKNOWN)
+    key(
+        f"10a: shape minutes outfield {int(outfield.sum())}, GK {int(per.GK.sum())}, UNKNOWN "
+        f"{int(per.UNKNOWN.sum())}, largest UNKNOWN share {share.max():.4f}"
+    )
+    shapes, labels = {}, {}
+    for c in table.itertuples():
+        m = per.loc[(c.league, c.team_id)]
+        shapes[c.key] = shape_of(m)
+        labels[c.key] = "-".join(str(n) for n in shapes[c.key].values())
+        total = m[sh.OUTFIELD].sum()
+        exact = " ".join(f"{PLACES * m[g] / total:.3f}" for g in sh.OUTFIELD)
+        key(f"10a: shape {c.key} {labels[c.key]} from {exact}")
+    kinds = Counter(labels.values())
+    by_count = {s: kinds[s] for s in sorted(kinds, key=lambda s: (-kinds[s], s))}
+    key(f"10a: shapes {by_count}")
+
     prices = priced.set_index("player_id").price.astype("int64")
     fits = dict(tuple(fit.groupby(["league_k", "team_id_k"])))
     near = dict(tuple(pairs.groupby(["league", "team_id"])))
@@ -482,8 +583,8 @@ def build(out=OUT):
         cands = priced.loc[priced.player_id.isin(f.player_id), own.columns]
         cands = cands.assign(price=cands.player_id.map(prices), score=cands.player_id.map(score))
         cands = cands.sort_values("player_id")
-        base, short, plans = club_plans(own, cands)
-        check_club(own, base, plans, score, prices)
+        base, short, plans = club_plans(own, cands, shapes[c.key])
+        check_club(own, base, plans, score, prices, shapes[c.key])
         records = [plan_record(p, own, base) for p in plans]
         for p in plans:
             signed = None
@@ -521,13 +622,13 @@ def build(out=OUT):
     key(f"10a: plans {len(tally)}: ok {reasons.count(None)}, {listed}")
     made = {k: sum(n == k for _, n in tally) for k in range(max(CAPS) + 1)}
     key(f"10a: ok plans by signings made {made}")
-    print(f"10a: gains of the plans with a baseline, smallest {min(gains)}, largest {max(gains)}")
+    key(f"10a: gains of the plans with a baseline, smallest {min(gains)}, largest {max(gains)}")
 
     counts = {"players": len(rows), "priced": len(priced), "clubs": len(table)}
     files = {
         "meta.json": meta(counts),
         "players.json": {"players": player_records(rows)},
-        "clubs.json": {"clubs": club_records(table, rows)},
+        "clubs.json": {"clubs": club_records(table, rows, shapes)},
         **club_files,
     }
     key(f"10a: largest number outside id positions {check_numbers(files)}")

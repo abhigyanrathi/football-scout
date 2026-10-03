@@ -1,38 +1,46 @@
 import itertools
 import json
+from collections import Counter
+from fractions import Fraction
 
 import numpy as np
 import pandas as pd
 import pytest
 
 from fbrecruit import gems, scout, squad, style, web
+from fbrecruit import shrinkage as sh
+from fbrecruit.paths import PROCESSED
 from fbrecruit.sources.statsbomb import LEAGUES, OUT
 
-# own players by group: one club fills the ten, the other is a CB and the FWD short
+# own players by group: in the 4-3-3, one club fills the ten and the other is a CB and the FWD
+# short; in a back three with two strikers and no WIDE place, one club fills the ten and the
+# other is a FB and a MID short, and both have WIDE players
 OWN_FULL = {"CB": 3, "FB": 2, "MID": 4, "WIDE": 3, "FWD": 1}
 OWN_SHORT = {"CB": 1, "FB": 2, "MID": 3, "WIDE": 2, "FWD": 0}
+BACK_THREE = {"CB": 3, "FB": 2, "MID": 3, "WIDE": 0, "FWD": 2}
+OWN_BACK_THREE_FULL = {"CB": 4, "FB": 2, "MID": 3, "WIDE": 2, "FWD": 3}
+OWN_BACK_THREE_SHORT = {"CB": 3, "FB": 1, "MID": 2, "WIDE": 3, "FWD": 2}
 PLAN_BUDGETS = [5_000_000, 12_000_000]
 # from p10a_build_summary.log
-DIGEST = "dcb0e50db827b598e64fdb1abf40930f652c4ac38b026891311ff1990bfe68ed"
+DIGEST = "63766f9b6cc03331565bf4f6b36f050ef9b979a3ac9dbcb1982c28d506e76520"
 COUNTS = {
     "players": 1247, "CB": 257, "FB": 254, "MID": 284, "WIDE": 286, "FWD": 166, "priced": 1166,
     "with a 2015 value": 1130, "with a year-later value": 1166, "clubs": 80,
 }  # fmt: skip
 SMALLEST = 75_000
-BASELINES = 65
-SHORT = {
-    "la_liga-215": {"MID": 1}, "la_liga-212": {"MID": 1}, "la_liga-322": {"MID": 1},
-    "la_liga-360": {"MID": 1}, "la_liga-218": {"MID": 1}, "premier_league-30": {"MID": 1},
-    "premier_league-38": {"MID": 1}, "serie_a-231": {"WIDE": 1}, "serie_a-290": {"WIDE": 1},
-    "serie_a-239": {"MID": 1}, "serie_a-233": {"FB": 1}, "serie_a-241": {"WIDE": 2},
-    "serie_a-230": {"WIDE": 2}, "ligue_1-139": {"MID": 1}, "ligue_1-136": {"WIDE": 2},
+SHAPES = {
+    "2-2-2-3-1": 32, "2-2-3-2-1": 15, "2-2-2-2-2": 12, "2-2-3-1-2": 7, "3-2-2-2-1": 5,
+    "2-3-2-2-1": 3, "3-2-3-0-2": 2, "2-2-3-0-3": 1, "3-1-2-3-1": 1, "3-1-3-2-1": 1,
+    "3-2-2-1-2": 1,
 }  # fmt: skip
+BASELINES = 79
+SHORT = {"serie_a-233": {"FB": 1}}
 PLANS = {
-    "ok": 2370, "more places than signings": 30, "too few candidates": 0, "budget too small": 0,
+    "ok": 2400, "more places than signings": 0, "too few candidates": 0, "budget too small": 0,
 }  # fmt: skip
-SIGNINGS = {0: 0, 1: 770, 2: 801, 3: 799}
+SIGNINGS = {0: 0, 1: 800, 2: 801, 3: 799}
 LARGEST = 3647
-FILES = (83, 8_525_791)
+FILES = (83, 8_536_224)
 
 
 def test_a_band_includes_its_lower_edge():
@@ -56,6 +64,69 @@ def test_each_reason_and_the_first_that_applies():
         "more places than signings"
     )
     assert web.infeasible(need, groups[no_mid], prices[no_mid], 2, 0) == "too few candidates"
+
+
+def test_largest_remainder_by_hand():
+    cases = [
+        # exact shares
+        ((6_000, 6_000, 6_000, 9_000, 3_000), (2, 2, 2, 3, 1)),
+        # 2.333, 2.167, 2.567, 1.933 and 1: WIDE and MID take the two places left
+        ((7_000, 6_500, 7_700, 5_800, 3_000), (2, 2, 3, 2, 1)),
+        # 3, 2, 2.5, 0.5 and 2: MID and WIDE tie for the last place and MID takes it
+        ((9_000, 6_000, 7_500, 1_500, 6_000), (3, 2, 3, 0, 2)),
+        # 3.333 three times: a three-way tie goes to CB
+        ((3, 3, 3, 0, 0), (4, 3, 3, 0, 0)),
+    ]
+    for minutes, want in cases:
+        shape = web.shape_of(dict(zip(sh.OUTFIELD, minutes, strict=True)))
+        assert shape == dict(zip(sh.OUTFIELD, want, strict=True))
+
+
+def test_a_shape_has_ten_places_each_within_one_of_its_share():
+    rng = np.random.default_rng(0)
+    for _ in range(500):
+        minutes = rng.integers(0, 4_001, 5) * (rng.random(5) < 0.7)
+        if not minutes.any():
+            minutes[rng.integers(5)] = rng.integers(1, 4_001)
+        shape = web.shape_of(dict(zip(sh.OUTFIELD, minutes, strict=True)))
+        total = int(minutes.sum())
+        assert list(shape) == sh.OUTFIELD and all(type(n) is int for n in shape.values())
+        assert sum(shape.values()) == 10
+        for g, m in zip(sh.OUTFIELD, minutes, strict=True):
+            assert abs(shape[g] - Fraction(10 * int(m), total)) < 1
+
+
+def made_up_season():
+    """One club's minutes and the three tables of groups: player 1 is in gems_value and in
+    style_player_w2 with another group, 2 only in player_group, 3 only in style_player_w2, 4 has
+    no minutes and no group, and 5 and 6 are a GK and an UNKNOWN in player_group."""
+    club = {"league": "la_liga", "team_id": 1}
+    season = pd.DataFrame(
+        {**club, "player_id": [1, 2, 3, 4, 5, 6], "minutes": [900, 600, 300, 0, 3_420, 200]}
+    )
+    value = pd.DataFrame({**club, "player_id": [1], "group": ["MID"], "minutes": [900]})
+    w1 = pd.DataFrame({**club, "player_id": [2, 5, 6], "group": ["CB", "GK", "UNKNOWN"]})
+    w2 = pd.DataFrame({**club, "player_id": [1, 3], "group": ["WIDE", "FB"]})
+    return season, value, w1, w2
+
+
+def test_a_player_team_takes_the_first_group_that_holds_its_key():
+    season, value, w1, w2 = made_up_season()
+    rows = web.season_groups(season, value, w1, w2)
+    assert rows.set_index("player_id")[["group", "source"]].to_dict("index") == {
+        1: {"group": "MID", "source": "gems_value"},
+        2: {"group": "CB", "source": "player_group"},
+        3: {"group": "FB", "source": "style_player_w2"},
+        5: {"group": "GK", "source": "player_group"},
+        6: {"group": "UNKNOWN", "source": "player_group"},
+    }
+    # 600 CB, 300 FB and 900 MID minutes give shares of 3.333, 1.667 and 5; the GK's and the
+    # UNKNOWN's minutes count toward no group
+    minutes = rows.groupby("group").minutes.sum().reindex(sh.GROUPS, fill_value=0)
+    assert web.shape_of(minutes) == {"CB": 3, "FB": 2, "MID": 5, "WIDE": 0, "FWD": 0}
+    extra = pd.DataFrame({"league": ["la_liga"], "team_id": [1], "player_id": [7], "minutes": [90]})
+    with pytest.raises(AssertionError, match="minutes and no group"):
+        web.season_groups(pd.concat([season, extra], ignore_index=True), value, w1, w2)
 
 
 def made_up_club(seed, sizes):
@@ -86,18 +157,18 @@ def made_up_club(seed, sizes):
     return own, cands
 
 
-def best_total(own, cands, budget, k):
+def best_total(own, cands, budget, k, shape):
     """The highest summed P3_full over every set of at most k candidates within the budget, the
-    places they leave filled by the own players of highest P3_full, who cost nothing; None if
-    no set fills the ten."""
+    places of the shape they leave filled by the own players of highest P3_full, who cost
+    nothing; None if no set fills the shape."""
     values, prices, groups = (cands[c].to_numpy() for c in ("P3_full", "price", "group"))
-    top = {g: np.sort(own.P3_full[own.group == g].to_numpy())[::-1] for g in squad.QUOTAS}
+    top = {g: np.sort(own.P3_full[own.group == g].to_numpy())[::-1] for g in shape}
     best = None
     for n in range(k + 1):
         for s in map(list, itertools.combinations(range(len(cands)), n)):
             if prices[s].sum() > budget:
                 continue
-            left = {g: q - int((groups[s] == g).sum()) for g, q in squad.QUOTAS.items()}
+            left = {g: q - int((groups[s] == g).sum()) for g, q in shape.items()}
             if any(m < 0 or m > len(top[g]) for g, m in left.items()):
                 continue
             total = values[s].sum() + sum(top[g][:m].sum() for g, m in left.items())
@@ -105,26 +176,36 @@ def best_total(own, cands, budget, k):
     return best
 
 
-@pytest.mark.parametrize("seed, sizes", [(0, OWN_FULL), (1, OWN_SHORT)])
-def test_plans_match_brute_force(seed, sizes):
+@pytest.mark.parametrize(
+    "seed, sizes, shape, short",
+    [
+        (0, OWN_FULL, squad.QUOTAS, {}),
+        (1, OWN_SHORT, squad.QUOTAS, {"CB": 1, "FWD": 1}),
+        (2, OWN_BACK_THREE_FULL, BACK_THREE, {}),
+        (3, OWN_BACK_THREE_SHORT, BACK_THREE, {"FB": 1, "MID": 1}),
+    ],
+)
+def test_plans_match_brute_force(seed, sizes, shape, short):
     own, cands = made_up_club(seed, sizes)
-    base, short, plans = web.club_plans(own, cands, PLAN_BUDGETS)
-    if sizes == OWN_FULL:
-        best = [own[own.group == g].nlargest(q, "P3_full") for g, q in squad.QUOTAS.items()]
-        assert sorted(base.player_id) == sorted(pd.concat(best).player_id) and short == {}
+    base, got, plans = web.club_plans(own, cands, shape, PLAN_BUDGETS)
+    assert got == short
+    if short:
+        assert base is None
     else:
-        assert base is None and short == {"CB": 1, "FWD": 1}
+        best = [own[own.group == g].nlargest(n, "P3_full") for g, n in shape.items()]
+        assert sorted(base.player_id) == sorted(pd.concat(best).player_id)
     order = [(b, k, f) for b in PLAN_BUDGETS for k in web.CAPS for f in (False, True)]
     assert [(p["budget"], p["cap"], p["fit"]) for p in plans] == order
     for p in plans:
         c = cands[cands.score > 0] if p["fit"] else cands
-        best = best_total(own, c, p["budget"], p["cap"])
+        best = best_total(own, c, p["budget"], p["cap"], shape)
         rows = p["rows"]
         if best is None:
             assert rows is None and p["reason"] in web.REASONS
             continue
         assert p["reason"] is None and abs(rows.P3_full.sum() - best) <= 1e-9
-        assert rows.group.value_counts().to_dict() == squad.QUOTAS
+        # all five groups are counted, so in the back three no WIDE player is picked
+        assert {g: int((rows.group == g).sum()) for g in sh.OUTFIELD} == shape
         signed = rows[~rows.player_id.isin(own.player_id)]
         assert signed.player_id.isin(c.player_id).all()
         assert len(signed) <= p["cap"] and signed.price.sum() <= p["budget"]
@@ -289,6 +370,22 @@ def test_the_committed_files_have_the_logged_digest():
     assert web.digest(web.read_files(web.OUT)) == DIGEST
 
 
+def test_the_committed_plans_fill_each_club_shape():
+    files = {path: json.loads(content) for path, content in web.read_files(web.OUT).items()}
+    assert "quotas" not in files["meta.json"]
+    group = {p["id"]: p["group"] for p in files["players.json"]["players"]}
+    for club in files["clubs.json"]["clubs"]:
+        shape = club["shape"]
+        assert list(shape) == sh.OUTFIELD and sum(shape.values()) == 10
+        f = files[f"clubs/{club['key']}.json"]
+        if f["baseline"] is None:
+            continue
+        base = set(f["baseline"]["players"])
+        tens = [(base - set(p["out"])) | set(p["in"]) for p in f["plans"] if p["status"] == "ok"]
+        for ten in [base, *tens]:
+            assert {g: sum(group[p] == g for p in ten) for g in sh.OUTFIELD} == shape
+
+
 def need(path):
     if not path.exists():
         pytest.skip(f"local data cache missing: {path}")
@@ -299,6 +396,8 @@ def need(path):
 def test_a_rebuild_gives_the_committed_bytes(tmp_path):
     tables = [gems.value_path(), gems.decision_path(), gems.scores_path(), gems.outcomes_path()]
     tables += [style.season_path(), style.team_season_path(), scout.fit_path(), scout.pairs_path()]
+    tables += [PROCESSED / "minutes_player_team_statsbomb.parquet", sh.group_path()]
+    tables += [style.window2_path()]
     for lg in LEAGUES:
         tables += [OUT / lg / f"{name}.parquet" for name in ("games", "teams", "lineups")]
     for path in tables:
@@ -328,6 +427,8 @@ def test_the_counts_of_the_summary_log():
         "clubs": len(clubs),
     }
     assert got == COUNTS
+    shapes = Counter("-".join(str(n) for n in club["shape"].values()) for club in clubs)
+    assert shapes == SHAPES
     short, plans, made = {}, dict.fromkeys(PLANS, 0), dict.fromkeys(SIGNINGS, 0)
     for club in clubs:
         f = files[f"clubs/{club['key']}.json"]
