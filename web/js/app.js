@@ -57,9 +57,41 @@ function fill(element, html) {
   if (id) $(id)?.focus();
 }
 
+// A table wider than its box scrolls sideways, and the stylesheet brings it to rest with a column
+// starting where the name column ends. For that it needs the box marked and two lengths: the name
+// column's width, and the space after the table that lets its last column rest there too.
+function measure(box) {
+  const table = box.firstElementChild;
+  const columns = table.tHead.rows[0].cells;
+  const width = (element) => element.getBoundingClientRect().width;
+  const name = width(columns[0]);
+  // in whole pixels: the strip of ground that covers the space is then a whole number wide, and
+  // cannot stop a pixel short of the box's edge
+  const end = Math.ceil(Math.max(0, width(box) - name - width(columns[columns.length - 1])));
+  const wide = box.classList.toggle("wide", table.offsetWidth > box.clientWidth);
+  for (const [key, length] of [["--name", name], ["--end", end]]) {
+    if (wide) box.style.setProperty(key, `${length}px`);
+    else box.style.removeProperty(key);
+  }
+}
+
+const resized = new ResizeObserver((entries) => entries.forEach(({ target }) => measure(target)));
+
+// Measure the tables now on the page, and each again whenever its box changes size.
+function watch() {
+  resized.disconnect();
+  for (const box of document.querySelectorAll(".table-scroll")) {
+    measure(box);
+    resized.observe(box, { box: "border-box" });
+  }
+}
+
 function drawView() {
   const file = files.get(state.club);
-  if (file) return fill(view, views.view(data, state, file));
+  if (file) {
+    fill(view, views.view(data, state, file));
+    return watch();
+  }
   const asked = state;
   view.innerHTML = views.loading(data.club.get(state.club));
   clubFile(state.club).then(() => moved(asked, state) || drawView(), fail);
@@ -81,6 +113,7 @@ function drawDetail() {
   const keys = [state.club, player.club];
   fill(dialog, views.detail(data, state, player, ...keys.map((key) => files.get(key))));
   if (!dialog.open) dialog.showModal();
+  watch();
   if (drawn?.player !== state.player) {
     dialog.scrollTop = 0;
     $("detail-name").focus();
@@ -132,6 +165,7 @@ function showMore(button) {
   box.querySelector(".tally").textContent = views.tally(shown, total);
   button.dataset.from = shown;
   button.hidden = shown >= total;
+  measure(body.closest(".table-scroll"));
   // the focus moves to the first new row, so the keyboard carries on from there
   last.nextElementSibling?.querySelector("a")?.focus();
 }

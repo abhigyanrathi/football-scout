@@ -730,8 +730,39 @@ table {
   position: relative;
   overflow-x: auto;
   background:
-    linear-gradient(to left, var(--chalk) 1rem, transparent) right / 1.25rem 100% no-repeat local,
+    linear-gradient(to left, var(--chalk) calc(var(--end, 0px) + 1rem), transparent) right /
+      calc(var(--end, 0px) + 1.25rem) 100% no-repeat local,
     linear-gradient(to left, rgb(20 32 26 / 0.2), transparent) right / 0.75rem 100% no-repeat scroll;
+}
+
+/* A table wider than its box comes to rest only where a column starts at the end of the name
+   column, so the name never lies over part of a column. The script marks such a box and gives it
+   two lengths: the name column's width, and the space after the table that lets its last column
+   rest there too. The strip of ground reaches across that space. */
+.table-scroll.wide {
+  scroll-snap-type: x mandatory;
+}
+
+/* a margin on each column, not padding on the box: padding would leave the name column outside
+   the part of the box that the focus is scrolled into, so moving the focus would move the table */
+.table-scroll.wide thead th:not(:first-child) {
+  scroll-margin-inline-start: var(--name);
+  scroll-snap-align: start;
+}
+
+.table-scroll.wide table {
+  position: relative;
+}
+
+/* the space is an empty box after the table, not padding on the scroll box: browsers have not
+   all let that padding be scrolled into view */
+.table-scroll.wide table::after {
+  content: "";
+  position: absolute;
+  top: 0;
+  left: 100%;
+  width: var(--end);
+  height: 1px;
 }
 
 .table-scroll table {
@@ -770,6 +801,22 @@ table {
   min-width: 11rem;
   font-weight: 400;
   white-space: normal;
+}
+
+/* Below 22.5rem the name column gives way, so that each of the other columns still fits in the
+   space beside it: one wider than that space could come to rest part under the name. */
+@media (max-width: 22.4375rem) {
+  .table-scroll tbody th {
+    min-width: 9rem;
+    overflow-wrap: anywhere;
+  }
+}
+
+/* The club's own players have a column of 21rem from 80rem up. With a narrower name column and
+   less space after the name, the table fits it, and fits a phone 22.5rem wide. */
+.view-replace .view-controls .table-scroll tbody th {
+  min-width: 9rem;
+  padding-right: 0.3125rem;
 }
 
 /* a group's heading spans the table, so no column passes beneath it: without a ground of its own
