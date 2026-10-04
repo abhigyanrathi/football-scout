@@ -735,10 +735,11 @@ table {
     linear-gradient(to left, rgb(20 32 26 / 0.2), transparent) right / 0.75rem 100% no-repeat scroll;
 }
 
-/* A table wider than its box comes to rest only where a column starts at the end of the name
-   column, so the name never lies over part of a column. The script marks such a box and gives it
-   two lengths: the name column's width, and the space after the table that lets its last column
-   rest there too. The strip of ground reaches across that space. */
+/* A table wider than its box by more than a cell's padding comes to rest only where a column
+   starts at the end of the name column, so the name never lies over part of a column. At its end
+   it shows as many of its last columns as fit beside the name. The script marks such a box and
+   gives it two lengths: the name column's width, and the space after the table that lets the
+   first of those columns rest there too. The strip of ground reaches across that space. */
 .table-scroll.wide {
   scroll-snap-type: x mandatory;
 }
@@ -748,6 +749,13 @@ table {
 .table-scroll.wide thead th:not(:first-child) {
   scroll-margin-inline-start: var(--name);
   scroll-snap-align: start;
+}
+
+/* The script marks the first of those last columns as well. The columns after it have no resting
+   place of their own: it would lie past the end of the scroll range, and browsers take such a
+   place for the end itself, a pixel or two further on. */
+.table-scroll.wide thead th[data-last-rest] ~ th {
+  scroll-snap-align: none;
 }
 
 .table-scroll.wide table {
@@ -803,12 +811,19 @@ table {
   white-space: normal;
 }
 
-/* Below 22.5rem the name column gives way, so that each of the other columns still fits in the
-   space beside it: one wider than that space could come to rest part under the name. */
+/* On a phone each of the other columns has to fit in the space beside the name column, with room
+   to spare: one wider than that space could not be brought wholly into view. So below 24rem a
+   long word in a name breaks rather than widen the column, and below 22.5rem the column gives way
+   as well. */
+@media (max-width: 23.9375rem) {
+  .table-scroll tbody th {
+    overflow-wrap: anywhere;
+  }
+}
+
 @media (max-width: 22.4375rem) {
   .table-scroll tbody th {
     min-width: 9rem;
-    overflow-wrap: anywhere;
   }
 }
 

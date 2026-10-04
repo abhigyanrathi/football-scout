@@ -58,21 +58,39 @@ function fill(element, html) {
 }
 
 // A table wider than its box scrolls sideways, and the stylesheet brings it to rest with a column
-// starting where the name column ends. For that it needs the box marked and two lengths: the name
-// column's width, and the space after the table that lets its last column rest there too.
+// starting where the name column ends. At its end it shows as many of its last columns as fit
+// beside the name. For that the stylesheet needs the box marked, the first of those columns
+// marked, and two lengths: the name column's width, and the space after the table that lets that
+// column rest there too.
 function measure(box) {
   const table = box.firstElementChild;
-  const columns = table.tHead.rows[0].cells;
+  const columns = [...table.tHead.rows[0].cells];
   const width = (element) => element.getBoundingClientRect().width;
-  const name = width(columns[0]);
-  // in whole pixels: the strip of ground that covers the space is then a whole number wide, and
-  // cannot stop a pixel short of the box's edge
-  const end = Math.ceil(Math.max(0, width(box) - name - width(columns[columns.length - 1])));
-  const wide = box.classList.toggle("wide", table.offsetWidth > box.clientWidth);
+  const widths = columns.map(width);
+  const name = widths[0];
+  const beside = width(box) - name;
+  // A table wider than its box by no more than a cell's left padding is left as one that fits.
+  // It moves by that much at most, so the name covers only the padding of the column beside it.
+  const padding = parseFloat(getComputedStyle(columns[1]).paddingLeft);
+  const wide = box.classList.toggle("wide", width(table) - width(box) > padding);
+  // the last columns that fit beside the name together start at the column first
+  let first = columns.length;
+  let run = 0;
+  while (first > 1 && run + widths[first - 1] <= beside) {
+    first -= 1;
+    run += widths[first];
+  }
+  // The space is what those columns leave beside the name, in whole pixels and one more. In whole
+  // pixels, the strip of ground that covers it cannot stop a pixel short of the box's edge. The
+  // pixel more keeps the resting place inside the scroll range however a browser rounds. Where
+  // not even the last column fits, there is no such place and no space.
+  const end = first < columns.length ? Math.ceil(beside - run) + 1 : 0;
+  columns.forEach((cell, i) => cell.toggleAttribute("data-last-rest", wide && i === first));
   for (const [key, length] of [["--name", name], ["--end", end]]) {
     if (wide) box.style.setProperty(key, `${length}px`);
     else box.style.removeProperty(key);
   }
+  if (!box.style.length) box.removeAttribute("style");
 }
 
 const resized = new ResizeObserver((entries) => entries.forEach(({ target }) => measure(target)));
