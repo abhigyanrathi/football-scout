@@ -313,6 +313,8 @@ def test_depth3_fold_training_rows_and_positives(k):
 @pytest.mark.slow
 @pytest.mark.parametrize("name", D3_FITS)
 def test_depth3_full_fit_training_rows_and_positives(name):
+    for league, _ in full_fit_parts(name):
+        need(labels_path(league))
     y = train_labels(full_fit_parts(name))
     assert (len(y), int(y.scores.sum()), int(y.concedes.sum())) == D3_FITS[name]
 

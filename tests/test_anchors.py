@@ -56,6 +56,8 @@ def test_statsbomb_league(league):
 
 
 def test_statsbomb_totals():
+    for league in STATSBOMB:
+        need(INTERIM / "statsbomb" / league / "lineups.parquet")
     lineups = load_lineups("statsbomb")
     assert sum(len(table("statsbomb", lg, "games")) for lg in STATSBOMB) == 1517
     assert len(lineups) == 42096
@@ -79,6 +81,8 @@ def test_wyscout_games(league):
 
 
 def test_wyscout_totals():
+    for league in WYSCOUT_GAMES:
+        need(INTERIM / "wyscout" / league / "lineups.parquet")
     lineups = load_lineups("wyscout")
     assert len(lineups) == 50590
     assert lineups.minutes_played.sum() == 3804657

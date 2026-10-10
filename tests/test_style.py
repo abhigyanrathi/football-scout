@@ -491,6 +491,8 @@ def test_games_read_and_pressure_events(league):
 
 @pytest.mark.slow
 def test_every_pressure_has_a_lineup_row():
+    for league in GAMES:
+        need(style.OUT / league / "lineups.parquet")
     lu = minutes.load_lineups("statsbomb")[["league", "game_id", "team_id", "player_id"]]
     lu = lu.astype({"team_id": "int64"}).drop_duplicates().assign(found=True)
     pr = pd.concat(pressures(lg).assign(league=lg) for lg in GAMES)
