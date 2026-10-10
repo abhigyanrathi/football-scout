@@ -1,7 +1,6 @@
 import inspect
 import json
 import sys
-from pathlib import Path
 
 import numpy as np
 import pandas as pd
@@ -11,11 +10,10 @@ from fbrecruit import actionvalue as av
 from fbrecruit import calibration as cal
 from fbrecruit import minutes
 from fbrecruit.logs import Tee, key, show
-from fbrecruit.paths import INTERIM, PROCESSED
+from fbrecruit.paths import INTERIM, LOGS, PROCESSED
 from fbrecruit.sources.statsbomb import LEAGUES
 from fbrecruit.split import windows
 
-LOGS = Path("C:/Users/abhig/fb-scratch")
 BRANCHES = cal.BRANCHES
 # The order the league indicator columns and the per-league arrays are built in.
 LEAGUE_ORDER = list(LEAGUES)

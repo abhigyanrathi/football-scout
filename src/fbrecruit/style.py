@@ -1,6 +1,5 @@
 import sys
 import time
-from pathlib import Path
 
 import numpy as np
 import pandas as pd
@@ -10,11 +9,10 @@ from socceraction.spadl import play_left_to_right
 from fbrecruit import gems, manifest, minutes
 from fbrecruit import shrinkage as sh
 from fbrecruit.logs import Tee, key, show
-from fbrecruit.paths import PROCESSED
+from fbrecruit.paths import LOGS, PROCESSED
 from fbrecruit.sources.statsbomb import LEAGUES, OUT, Loader, retry
 from fbrecruit.split import windows
 
-LOGS = Path("C:/Users/abhig/fb-scratch")
 IN_POSSESSION = [
     "pass", "cross", "throw_in", "freekick_crossed", "freekick_short", "corner_crossed",
     "corner_short", "take_on", "dribble", "shot", "shot_freekick", "shot_penalty", "bad_touch",
