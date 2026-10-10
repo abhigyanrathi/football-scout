@@ -1,5 +1,7 @@
 # Football Scout
 
+[![Tests](https://github.com/abhigyanrathi/football-scout/actions/workflows/ci.yml/badge.svg)](https://github.com/abhigyanrathi/football-scout/actions/workflows/ci.yml)
+
 Football Scout is a scouting tool for the 2015/16 season of four leagues: the Premier League, La Liga, Serie A and Ligue 1. Choose a club and it does what a recruitment team could have done in the summer of 2016: find players whose output looks high for their price, find players who play like one of the club's own, and plan the signings that would raise the club's side most within a budget.
 
 **Site:** https://abhigyanrathi.github.io/football-scout/
@@ -48,7 +50,7 @@ Reported beside the tests, with no rule:
 - **Rules first.** Each test's design and pass rule were entered in `docs/decisions.md`, dated, and committed before its result was computed. Corrections are recorded as entries of their own.
 - **Whole teams redrawn.** Uncertainty comes from a bootstrap that redraws teams, 20 per league, 2,000 times. Teammates share opponents, a schedule and a way of playing, so redrawing players would make the intervals too narrow. The rating models are held fixed in the redraws, so the intervals are conditional on them.
 - **No leakage.** A value used as a target never comes from a model that trained on it.
-- **Tests.** pytest for the pipeline, where the tests that read the local data are marked slow; Node tests for the site's logic; static checks of the pages; a check of the workflow's pinned actions; and ruff.
+- **Tests.** pytest for the pipeline, where the tests that read the local data are marked slow; Node tests for the site's logic; static checks of the pages; a check of the workflows' pinned actions; and ruff. GitHub Actions runs them all, apart from the slow tests, on Linux and Windows for every push to main and every pull request.
 
 ## What's where
 
@@ -160,8 +162,9 @@ Tests:
 ```
 python -m pytest                            # all of them; a slow test skips when its data isn't there
 python -m pytest -m "not slow"              # the tests that don't read the data
-node --test tests/js/core.test.mjs
+node --test tests/js/core.test.mjs          # needs Node 22.7 or later
 python -m ruff check .
+python -m ruff format --check .
 ```
 
 ## Limitations
